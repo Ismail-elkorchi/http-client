@@ -1,0 +1,48 @@
+{
+  "name": "@ismail-elkorchi/http-client",
+  "version": "0.1.0",
+  "description": "Bounded HTTP client primitives for Node.js.",
+  "type": "module",
+  "sideEffects": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ismail-elkorchi/http-client.git"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint \"src/**/*.ts\"",
+    "check": "npm run typecheck && npm run lint",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run check && npm test"
+  },
+  "dependencies": {
+    "undici": "8.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "eslint": "10.8.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0"
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=11.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
