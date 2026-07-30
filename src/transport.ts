@@ -293,7 +293,10 @@ export class UndiciTransport {
           );
     return new Pool(origin, {
       allowH2,
-      connections: this.options.maxConnectionsPerOrigin,
+      connections:
+        this.options.protocolPreference === "http2"
+          ? 1
+          : this.options.maxConnectionsPerOrigin,
       maxHeaderSize: this.options.maxResponseFieldsBytes,
       connectTimeout: this.options.timeouts.connectMs,
       strictContentLength: true,

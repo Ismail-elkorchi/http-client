@@ -270,6 +270,57 @@ test("pins HTTP/2, trusts an explicit CA, and reports certificate facts", async 
   }
 });
 
+test("multiplexes concurrent strict HTTP/2 requests on one connection", async () => {
+  const certificate = await tlsFixture();
+  let connectionCount = 0;
+  let activeStreams = 0;
+  let peakStreams = 0;
+  const server = http2.createSecureServer({
+    key: certificate.key,
+    cert: certificate.cert,
+  });
+  server.on("session", () => {
+    connectionCount += 1;
+  });
+  server.on("stream", (stream) => {
+    activeStreams += 1;
+    peakStreams = Math.max(peakStreams, activeStreams);
+    setTimeout(() => {
+      activeStreams -= 1;
+      stream.respond({ ":status": 200 });
+      stream.end("multiplexed");
+    }, 25);
+  });
+  await listen(server);
+  const client = new NodeHttpClient({
+    protocolPreference: "http2",
+    maxConnectionsPerOrigin: 20,
+    resolver: async () => [{ address: "127.0.0.1", family: 4 }],
+    networkSafety: { allowLocalhost: true },
+    tls: { certificateAuthorities: certificate.cert },
+  });
+  try {
+    const results = await Promise.all(
+      Array.from(
+        { length: 20 },
+        async () =>
+          await client.requestBuffered(
+            `https://localhost:${String(portOf(server))}/`,
+          ),
+      ),
+    );
+    assert.equal(
+      results.every((result) => result.kind === "response"),
+      true,
+    );
+    assert.equal(connectionCount, 1);
+    assert.equal(peakStreams > 1, true);
+  } finally {
+    await client.close();
+    await closeServer(server);
+  }
+});
+
 test("establishes a verified TLS tunnel through an HTTP proxy", async () => {
   const certificate = await tlsFixture();
   const target = await listen(

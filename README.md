@@ -178,8 +178,10 @@ const proxyClient = new NodeHttpClient({
 
 `protocolPreference: "http2"` is strict: only TLS origins are accepted, and a
 connection is rejected before request bytes are written unless ALPN selects
-HTTP/2. Strict HTTP/2 is not accepted with a proxy because that negotiation
-cannot be verified before the tunneled request.
+HTTP/2. Strict HTTP/2 requests share one multiplexed connection per origin;
+`maxConnectionsPerOrigin` applies to HTTP/1.1 and automatic protocol
+negotiation. Strict HTTP/2 is not accepted with a proxy because that
+negotiation cannot be verified before the tunneled request.
 
 Retry policy, cookies, caches, rate limits, and application sessions belong in
 consumer adapters.
