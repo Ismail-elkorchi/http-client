@@ -383,6 +383,21 @@ test("correlates connection facts for concurrent HTTP/1.1 and HTTP/2 requests", 
   assert.match(second.tls?.protocol ?? "", /^TLSv/u);
 });
 
+test("bounds retained origin pools", async () => {
+  const firstServer = await listen(
+    http.createServer((_request, response) => response.end("first")),
+  );
+  const secondServer = await listen(
+    http.createServer((_request, response) => response.end("second")),
+  );
+  const client = localClient({ maxOrigins: 1 });
+  const first = await client.request(urlFor(firstServer, "/"));
+  assert.equal(first.ok, true);
+  const second = await client.request(urlFor(secondServer, "/"));
+  assert.equal(second.ok, false);
+  assert.equal(second.error.code, "FETCH_NETWORK_ERROR");
+});
+
 function localClient(configuration = {}) {
   return trackedClient({
     networkSafety: { allowLocalhost: true },
