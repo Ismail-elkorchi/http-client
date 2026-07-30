@@ -548,8 +548,6 @@ export class NodeHttpClient {
         createBody: preparedBody.create,
         signal: fieldsDeadline.signal,
         responseFieldsTimeoutMs: options.timeouts.responseFieldsMs,
-        responseBodyInactivityTimeoutMs:
-          options.timeouts.responseBodyProgressMs,
         onRequestBodyProgress: (sentBytes) => {
           emitHttpClientEvent(options.observer, {
             kind: "request-body-progress",
@@ -568,6 +566,7 @@ export class NodeHttpClient {
               },
       });
     } catch (caught) {
+      if (caught instanceof HttpConfigurationError) throw caught;
       return this.failure(
         context,
         classifyError(caught, url.href, fieldsDeadline.signal, false),

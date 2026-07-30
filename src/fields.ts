@@ -186,6 +186,11 @@ function validateFieldValue(value: string): void {
       "HTTP field values cannot start or end with whitespace.",
     );
   }
+  if (/[^\u0000-\u00ff]/u.test(value)) {
+    throw new HttpConfigurationError(
+      "HTTP field values must contain only Latin-1 characters.",
+    );
+  }
 }
 
 function rawFieldText(value: string | Uint8Array): string {

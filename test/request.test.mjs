@@ -431,6 +431,12 @@ test("rejects invalid request boundaries before network activity", async () => {
     );
     await assert.rejects(
       client.request("http://127.0.0.1/", {
+        fields: [{ name: "test", value: "not Latin-1: \u{1f642}" }],
+      }),
+      HttpConfigurationError,
+    );
+    await assert.rejects(
+      client.request("http://127.0.0.1/", {
         method: "POST",
         body: { kind: "text", text: "payload" },
         fields: [{ name: "content-length", value: "8" }],
@@ -470,6 +476,20 @@ test("rejects invalid request boundaries before network activity", async () => {
           { name: "content-type", value: "multipart/form-data" },
         ],
       }),
+      HttpConfigurationError,
+    );
+  } finally {
+    await client.close();
+  }
+});
+
+test("rejects malformed custom resolver records as configuration errors", async () => {
+  const client = new NodeHttpClient({
+    resolver: async () => [{ address: "not-an-ip", family: 4 }],
+  });
+  try {
+    await assert.rejects(
+      client.request("http://invalid-resolver.example/"),
       HttpConfigurationError,
     );
   } finally {

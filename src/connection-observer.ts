@@ -35,15 +35,57 @@ interface Subscription {
 }
 
 export class UndiciConnectionObserver {
+  #closed = false;
+
+  public constructor() {
+    diagnosticRouter.acquire();
+  }
+
+  public async observeRequest<T>(
+    context: {
+      readonly origin: string;
+      readonly path: string;
+      readonly method: string;
+    },
+    operation: () => Promise<T>,
+    onRequestBodyProgress: (sentBytes: number) => void,
+  ): Promise<ObservedRequest<T>> {
+    if (this.#closed) {
+      throw new Error("The transport observer is closed.");
+    }
+    return await diagnosticRouter.observeRequest(
+      context,
+      operation,
+      onRequestBodyProgress,
+    );
+  }
+
+  public recordConnectionDuration(
+    socket: Socket,
+    durationMs: number,
+  ): void {
+    diagnosticRouter.recordConnectionDuration(socket, durationMs);
+  }
+
+  public close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    diagnosticRouter.release();
+  }
+}
+
+class UndiciDiagnosticRouter {
   readonly #observations = new AsyncLocalStorage<Observation>();
   readonly #requests = new WeakMap<object, Observation>();
   readonly #pending = new Map<string, Observation[]>();
   readonly #connectionDurations = new WeakMap<Socket, number>();
   readonly #usedConnections = new WeakSet<Socket>();
-  readonly #subscriptions: readonly Subscription[];
-  #closed = false;
+  #subscriptions: readonly Subscription[] = [];
+  #clients = 0;
 
-  public constructor() {
+  public acquire(): void {
+    this.#clients += 1;
+    if (this.#clients !== 1) return;
     this.#subscriptions = [
       this.subscribe("undici:request:create", this.requestCreated),
       this.subscribe(
@@ -64,9 +106,6 @@ export class UndiciConnectionObserver {
     operation: () => Promise<T>,
     onRequestBodyProgress: (sentBytes: number) => void,
   ): Promise<ObservedRequest<T>> {
-    if (this.#closed) {
-      throw new Error("The transport observer is closed.");
-    }
     const observation: Observation = {
       ...context,
       socket: null,
@@ -99,13 +138,16 @@ export class UndiciConnectionObserver {
     this.#connectionDurations.set(socket, durationMs);
   }
 
-  public close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
+  public release(): void {
+    if (this.#clients === 0) {
+      throw new Error("The diagnostic router has no active client.");
+    }
+    this.#clients -= 1;
+    if (this.#clients !== 0) return;
     for (const { source, listener } of this.#subscriptions) {
       source.unsubscribe(listener);
     }
-    this.#observations.disable();
+    this.#subscriptions = [];
   }
 
   private readonly requestCreated = (message: unknown): void => {
@@ -232,6 +274,8 @@ export class UndiciConnectionObserver {
     };
   }
 }
+
+const diagnosticRouter = new UndiciDiagnosticRouter();
 
 function negotiatedVersion(socket: Socket): HttpVersion {
   return socket instanceof TLSSocket && socket.alpnProtocol === "h2"

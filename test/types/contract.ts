@@ -65,7 +65,9 @@ const cookies: readonly string[] = fields.all("set-cookie");
 void cookies;
 
 const extensionMethod = defineHttpMethod("PROPFIND");
-void new NodeHttpClient({ timeouts: { totalMs: null } }).request(
+void new NodeHttpClient({
+  timeouts: { totalMs: null, responseBodyProgressMs: null },
+}).request(
   "https://example.com/",
   {
     method: extensionMethod,

@@ -134,12 +134,16 @@ if (result.kind === "response") {
 
 `first()`, `all()`, `has()`, and iteration are lossless operations.
 `toHeaders()` is available when a caller explicitly accepts the Web
-`Headers` model.
+`Headers` model. Field values use the transport's Latin-1 byte model; values
+outside that range are rejected before network activity.
 
 ## Timeouts and observation
 
-Set `timeouts.totalMs` to `null` to disable only the total deadline. Connect,
-response-field, and response-body progress deadlines remain active.
+Set `timeouts.totalMs` or `timeouts.responseBodyProgressMs` to `null` to
+disable that deadline. The response-body progress deadline applies while a
+consumer is waiting for the next body chunk and is suspended while the
+consumer applies backpressure. Connect and response-field deadlines remain
+active.
 
 An observer receives discriminated attempt, request-body, response, and
 response-body progress events. Observer failures never alter the request.

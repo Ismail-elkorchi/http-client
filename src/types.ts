@@ -95,13 +95,13 @@ export interface HttpTimeouts {
   readonly totalMs: number | null;
   readonly connectMs: number;
   readonly responseFieldsMs: number;
-  readonly responseBodyProgressMs: number;
+  readonly responseBodyProgressMs: number | null;
 }
 
 export interface RequestTimeoutOverrides {
   readonly totalMs?: number | null;
   readonly responseFieldsMs?: number;
-  readonly responseBodyProgressMs?: number;
+  readonly responseBodyProgressMs?: number | null;
 }
 
 export type TlsMaterial =

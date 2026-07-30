@@ -40,7 +40,6 @@ export interface TransportRequestOptions {
   readonly createBody: () => TransportRequestBody | undefined;
   readonly signal: AbortSignal;
   readonly responseFieldsTimeoutMs: number;
-  readonly responseBodyInactivityTimeoutMs: number;
   readonly onInformationalResponse:
     | ((statusCode: number, fields: HttpFields) => void)
     | undefined;
@@ -134,7 +133,7 @@ export class UndiciTransport {
             responseHeaders: "raw",
             ...(body === undefined ? {} : { body }),
             headersTimeout: options.responseFieldsTimeoutMs,
-            bodyTimeout: options.responseBodyInactivityTimeoutMs,
+            bodyTimeout: 0,
             ...(options.onInformationalResponse === undefined
               ? {}
               : {

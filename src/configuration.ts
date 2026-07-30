@@ -343,7 +343,7 @@ function resolveTimeouts(
     "timeouts.responseFieldsMs",
     value.responseFieldsMs,
   );
-  validatePositiveInteger(
+  validateOptionalPositiveInteger(
     "timeouts.responseBodyProgressMs",
     value.responseBodyProgressMs,
   );
@@ -370,15 +370,16 @@ function resolveRequestTimeouts(
     responseFieldsMs:
       overrides?.responseFieldsMs ?? defaults.responseFieldsMs,
     responseBodyProgressMs:
-      overrides?.responseBodyProgressMs ??
-      defaults.responseBodyProgressMs,
+      overrides?.responseBodyProgressMs === undefined
+        ? defaults.responseBodyProgressMs
+        : overrides.responseBodyProgressMs,
   };
   validateOptionalPositiveInteger("timeouts.totalMs", value.totalMs);
   validatePositiveInteger(
     "timeouts.responseFieldsMs",
     value.responseFieldsMs,
   );
-  validatePositiveInteger(
+  validateOptionalPositiveInteger(
     "timeouts.responseBodyProgressMs",
     value.responseBodyProgressMs,
   );

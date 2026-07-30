@@ -132,6 +132,7 @@ test("preserves ordered repeated field lines", async () => {
       fields: [
         { name: "X-Repeated", value: "first" },
         { name: "x-repeated", value: "second" },
+        { name: "x-latin1", value: "caf\u00e9" },
       ],
     });
     assert.equal(result.kind, "response");
@@ -146,8 +147,69 @@ test("preserves ordered repeated field lines", async () => {
         : []
     );
     assert.deepEqual(repeatedRequestValues, ["first", "second"]);
+    const latin1Index = requestFields.findIndex(
+      (item) => item.toLowerCase() === "x-latin1",
+    );
+    assert.notEqual(latin1Index, -1);
+    assert.equal(requestFields[latin1Index + 1], "caf\u00e9");
   } finally {
     await client.close();
+    await closeServer(server);
+  }
+});
+
+test("isolates identical concurrent requests across client instances", async () => {
+  const server = await listen(
+    http.createServer((request, response) => {
+      let uploadedBytes = 0;
+      request.on("data", (chunk) => {
+        uploadedBytes += chunk.byteLength;
+      });
+      request.on("end", () => {
+        response.writeHead(200, { trailer: "x-uploaded-bytes" });
+        response.write("complete");
+        response.addTrailers({
+          "x-uploaded-bytes": String(uploadedBytes),
+        });
+        response.end();
+      });
+    }),
+  );
+  const clients = [
+    new NodeHttpClient({
+      networkSafety: { allowLocalhost: true },
+    }),
+    new NodeHttpClient({
+      networkSafety: { allowLocalhost: true },
+    }),
+  ];
+  const sizes = [3, 11];
+  try {
+    for (let iteration = 0; iteration < 10; iteration += 1) {
+      const results = await Promise.all(
+        clients.map(async (client, index) =>
+          await client.requestBuffered(urlFor(server, "/identical"), {
+            method: "POST",
+            body: { kind: "bytes", bytes: new Uint8Array(sizes[index]) },
+          })
+        ),
+      );
+      for (const [index, result] of results.entries()) {
+        assert.equal(result.kind, "response");
+        const attempt = result.attempts.at(-1);
+        assert.equal(attempt?.kind, "complete");
+        assert.equal(
+          attempt?.transfer.requestBodyBytesSent,
+          sizes[index],
+        );
+        assert.equal(
+          attempt?.transfer.trailers.first("x-uploaded-bytes"),
+          String(sizes[index]),
+        );
+      }
+    }
+  } finally {
+    await Promise.all(clients.map(async (client) => await client.destroy()));
     await closeServer(server);
   }
 });
@@ -254,9 +316,11 @@ test("reports attempt-scoped outcomes and structured progress", async () => {
   }
 });
 
-test("allows disabling only the total deadline", async () => {
+test("allows disabling total and response-progress deadlines", async () => {
   const server = await listen(
     http.createServer((_request, response) => {
+      response.writeHead(200);
+      response.flushHeaders();
       setTimeout(() => response.end("complete"), 50);
     }),
   );
@@ -265,7 +329,7 @@ test("allows disabling only the total deadline", async () => {
     timeouts: {
       totalMs: null,
       responseFieldsMs: 500,
-      responseBodyProgressMs: 500,
+      responseBodyProgressMs: null,
     },
   });
   try {
@@ -277,6 +341,13 @@ test("allows disabling only the total deadline", async () => {
   }
   assert.throws(
     () => new NodeHttpClient({ timeouts: { totalMs: 0 } }),
+    HttpConfigurationError,
+  );
+  assert.throws(
+    () =>
+      new NodeHttpClient({
+        timeouts: { responseBodyProgressMs: 0 },
+      }),
     HttpConfigurationError,
   );
 });

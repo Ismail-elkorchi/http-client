@@ -105,6 +105,7 @@ export class NetworkSafetyPolicy {
             )
           : evaluateNetworkAddresses(normalized, addresses, this.options);
     } catch (caught) {
+      if (caught instanceof HttpConfigurationError) throw caught;
       resolution = rejected(
         normalized,
         caught instanceof DnsTimeoutError

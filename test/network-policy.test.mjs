@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   DEFAULT_NETWORK_SAFETY,
+  HttpConfigurationError,
   NetworkSafetyPolicy,
   decideIp,
   evaluateNetworkAddresses,
@@ -120,15 +121,15 @@ test("bounds DNS resolution time", async () => {
   assert.equal(performance.now() - startedAt < 500, true);
 });
 
-test("rejects invalid resolver output as a DNS failure", async () => {
+test("preserves invalid resolver output as a contract error", async () => {
   const policy = new NetworkSafetyPolicy(
     DEFAULT_NETWORK_SAFETY,
     async () => [{ address: "not-an-ip", family: 4 }],
   );
-  const result = await policy.resolveHostname("invalid.example");
-  assert.equal(result.decision.allowed, false);
-  assert.equal(result.decision.rejectionKind, "dns");
-  assert.equal(result.decision.reason, "DNS lookup failed");
+  await assert.rejects(
+    policy.resolveHostname("invalid.example"),
+    HttpConfigurationError,
+  );
 });
 
 test("rejects invalid address inventories at the public boundary", () => {

@@ -31,7 +31,7 @@ export interface StreamingBodyOptions {
   readonly source: Readable;
   readonly contentEncoding: string | readonly string[] | undefined;
   readonly limits: ResponseTransferLimits;
-  readonly responseBodyProgressTimeoutMs: number;
+  readonly responseBodyProgressTimeoutMs: number | null;
   readonly signal: AbortSignal;
   readonly attemptStartedAt: number;
   readonly context: HttpAttemptContext;
@@ -56,19 +56,22 @@ export function createStreamingBody(
     );
   }
   const decoders = encodings.toReversed().map(createDecoder);
-  let progressTimer: ReturnType<typeof setTimeout>;
+  let progressTimer: ReturnType<typeof setTimeout> | undefined;
+  let awaitingChunk = false;
   const stopProgressTimer = (): void => {
+    if (progressTimer === undefined) return;
     clearTimeout(progressTimer);
+    progressTimer = undefined;
   };
   const requireProgress = (): void => {
-    clearTimeout(progressTimer);
+    const timeoutMs = options.responseBodyProgressTimeoutMs;
+    if (!awaitingChunk || timeoutMs === null) return;
+    stopProgressTimer();
     progressTimer = setTimeout(() => {
       options.source.destroy(
-        new ResponseBodyProgressTimeoutError(
-          options.responseBodyProgressTimeoutMs,
-        ),
+        new ResponseBodyProgressTimeoutError(timeoutMs),
       );
-    }, options.responseBodyProgressTimeoutMs);
+    }, timeoutMs);
   };
   const reportProgress = (): void => {
     emitHttpClientEvent(options.observer, {
@@ -102,8 +105,6 @@ export function createStreamingBody(
     decodedCounter,
     { signal: options.signal },
   );
-  requireProgress();
-  void pipelinePromise.then(stopProgressTimer, stopProgressTimer);
   const sourceIterator: AsyncIterator<unknown> =
     nodeBody[Symbol.asyncIterator]();
 
@@ -111,6 +112,7 @@ export function createStreamingBody(
     if (cancellationRequested) return;
     cancellationRequested = true;
     cancellationReason = reason;
+    stopProgressTimer();
     options.source.destroy(reason);
     nodeBody.destroy(reason);
     void sourceIterator.return?.().catch(ignoreFailure);
@@ -118,6 +120,8 @@ export function createStreamingBody(
 
   const body = new ReadableStream<Uint8Array>({
     async pull(controller): Promise<void> {
+      awaitingChunk = true;
+      requireProgress();
       try {
         const result = await sourceIterator.next();
         if (result.done) {
@@ -127,13 +131,16 @@ export function createStreamingBody(
         controller.enqueue(toBytes(result.value));
       } catch (caught) {
         controller.error(options.classifyFailure(caught, decoders.length > 0));
+      } finally {
+        awaitingChunk = false;
+        stopProgressTimer();
       }
     },
     async cancel(reason): Promise<void> {
       cancel(reason instanceof Error ? reason : undefined);
       await pipelinePromise.catch(ignoreFailure);
     },
-  });
+  }, { highWaterMark: 0 });
 
   const completion = completePipeline(
     pipelinePromise,

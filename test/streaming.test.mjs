@@ -409,6 +409,62 @@ test("distinguishes response-field and body-inactivity deadlines", async () => {
   }
 });
 
+test("suspends body-progress deadlines while the consumer applies backpressure", async () => {
+  const chunk = Buffer.alloc(64 * 1024, 7);
+  const chunkCount = 256;
+  const server = await listen(
+    http.createServer((_request, response) => {
+      response.writeHead(200);
+      response.flushHeaders();
+      let written = 0;
+      const write = () => {
+        while (written < chunkCount) {
+          written += 1;
+          if (!response.write(chunk)) {
+            response.once("drain", write);
+            return;
+          }
+        }
+        response.end();
+      };
+      write();
+    }),
+  );
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+    timeouts: {
+      totalMs: 5_000,
+      responseFieldsMs: 500,
+      responseBodyProgressMs: 20,
+    },
+  });
+  try {
+    const result = await client.request(urlFor(server), {
+      responseTransferLimits: {
+        maxWireBytes: 20 * 1024 * 1024,
+        maxDecodedBytes: 20 * 1024 * 1024,
+      },
+    });
+    assert.equal(result.kind, "response");
+    const reader = result.body.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    let received = first.value?.byteLength ?? 0;
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      received += next.value.byteLength;
+    }
+    assert.equal(received, chunk.byteLength * chunkCount);
+    const completion = await result.completion;
+    assert.equal(completion.kind, "complete");
+  } finally {
+    await client.destroy();
+    await closeServer(server);
+  }
+});
+
 test("propagates caller cancellation through a live response", async () => {
   const server = await listen(
     http.createServer((_request, response) => {
