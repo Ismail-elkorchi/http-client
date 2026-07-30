@@ -81,6 +81,10 @@ try {
 Responses larger than `memoryThresholdBytes` are stored in private temporary
 files. Wire and decoded byte limits apply before storage.
 
+`openResponseBodyFile()` safely adopts a persistent cache file without giving
+disposal permission to delete it. `collectResponseBody()` turns a byte stream
+into a branded response body with an explicit byte limit and storage policy.
+
 ## Send a request body
 
 Request bodies are discriminated and replayable across redirects:

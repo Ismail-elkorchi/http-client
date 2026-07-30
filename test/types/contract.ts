@@ -1,4 +1,5 @@
 import {
+  collectResponseBody,
   defineHttpMethod,
   HttpFields,
   NodeHttpClient,
@@ -63,6 +64,18 @@ const fields = new HttpFields([
 ]);
 const cookies: readonly string[] = fields.all("set-cookie");
 void cookies;
+
+const collected = collectResponseBody(
+  new ReadableStream<Uint8Array>(),
+  {
+    maxBytes: 1024,
+    storage: {
+      memoryThresholdBytes: 512,
+      spoolDirectory: null,
+    },
+  },
+);
+void collected;
 
 const extensionMethod = defineHttpMethod("PROPFIND");
 void new NodeHttpClient({

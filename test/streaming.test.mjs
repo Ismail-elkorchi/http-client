@@ -6,11 +6,14 @@ import path from "node:path";
 import { test } from "node:test";
 import { gzipSync, zstdCompressSync } from "node:zlib";
 import {
+  collectResponseBody,
   HttpClientError,
   NodeHttpClient,
   HttpConfigurationError,
+  openResponseBodyFile,
   disposeResponseBody,
   readResponseBody,
+  ResponseBodyCollectionLimitError,
 } from "../dist/index.js";
 import {
   closeServer,
@@ -72,6 +75,70 @@ test("rejects caller-constructed response bodies", async () => {
       HttpConfigurationError,
     );
     assert.equal(await fs.readFile(file, "utf8"), "retain");
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("adopts persistent files and collects bounded response streams", async () => {
+  const directory = await fs.mkdtemp(
+    path.join(os.tmpdir(), "http-client-body-source-test-"),
+  );
+  const persistentFile = path.join(directory, "persistent.body");
+  await fs.writeFile(persistentFile, "persistent");
+  try {
+    const persistent = await openResponseBodyFile(persistentFile);
+    assert.equal(persistent.kind, "file");
+    assert.equal(persistent.temporary, false);
+    assert.equal(
+      new TextDecoder().decode(await readResponseBody(persistent)),
+      "persistent",
+    );
+    await disposeResponseBody(persistent);
+    assert.equal(await fs.readFile(persistentFile, "utf8"), "persistent");
+
+    const collected = await collectResponseBody(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("collected"));
+          controller.close();
+        },
+      }),
+      {
+        maxBytes: 9,
+        storage: {
+          memoryThresholdBytes: 2,
+          spoolDirectory: directory,
+        },
+      },
+    );
+    assert.equal(collected.kind, "file");
+    assert.equal(
+      new TextDecoder().decode(await readResponseBody(collected)),
+      "collected",
+    );
+    const collectedPath = collected.path;
+    await disposeResponseBody(collected);
+    await assert.rejects(fs.stat(collectedPath), /ENOENT/u);
+
+    await assert.rejects(
+      collectResponseBody(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array(4));
+            controller.close();
+          },
+        }),
+        {
+          maxBytes: 3,
+          storage: {
+            memoryThresholdBytes: 1,
+            spoolDirectory: directory,
+          },
+        },
+      ),
+      ResponseBodyCollectionLimitError,
+    );
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

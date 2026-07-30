@@ -91,6 +91,12 @@ export interface ResponseStorageOptions {
   readonly spoolDirectory: string | null;
 }
 
+export interface ResponseBodyCollectionOptions {
+  readonly maxBytes: number;
+  readonly storage: ResponseStorageOptions;
+  readonly signal?: AbortSignal;
+}
+
 export interface HttpTimeouts {
   readonly totalMs: number | null;
   readonly connectMs: number;

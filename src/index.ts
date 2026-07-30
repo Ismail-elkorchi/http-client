@@ -1,6 +1,9 @@
 export {
+  collectResponseBody,
   disposeResponseBody,
+  openResponseBodyFile,
   readResponseBody,
+  ResponseBodyCollectionLimitError,
   responseBodyPrefix,
   responseBodySize,
   responseBodyStream,
@@ -11,7 +14,13 @@ export {
   HttpConfigurationError,
 } from "./errors.js";
 export { HttpFields } from "./fields.js";
+export { mergeHttpFields } from "./fields.js";
+export { parseContentLength } from "./content-length.js";
 export { defineHttpMethod } from "./method.js";
+export {
+  requestAfterRedirect,
+  type RedirectedRequest,
+} from "./request-fields.js";
 export {
   DEFAULT_HTTP_CLIENT_OPTIONS,
   DEFAULT_HTTP_TIMEOUTS,
@@ -79,6 +88,7 @@ export type {
   RequestByteStream,
   RequestTimeoutOverrides,
   ResponseBody,
+  ResponseBodyCollectionOptions,
   ResponseContentDecoding,
   ResponseHeadTimings,
   ResponseStorageOptions,
