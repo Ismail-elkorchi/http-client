@@ -343,36 +343,50 @@ async function* iterateLimitedBytes(
     }
     return chunk;
   };
-  if (isWebReadableStream(source)) {
-    const reader = source.getReader();
-    let completed = false;
-    try {
-      for (;;) {
-        const result = await reader.read();
-        if (result.done) {
-          completed = true;
-          break;
+  try {
+    if (isWebReadableStream(source)) {
+      const reader = source.getReader();
+      let completed = false;
+      try {
+        for (;;) {
+          const result = await reader.read();
+          if (result.done) {
+            completed = true;
+            break;
+          }
+          if (!(result.value instanceof Uint8Array)) {
+            throw new RequestBodySourceError(
+              "A request body stream produced a non-byte chunk.",
+            );
+          }
+          yield account(result.value);
         }
-        if (!(result.value instanceof Uint8Array)) {
+      } finally {
+        if (!completed) await reader.cancel();
+        reader.releaseLock();
+      }
+    } else {
+      for await (const chunk of source) {
+        if (!(chunk instanceof Uint8Array)) {
           throw new RequestBodySourceError(
-            "A request body stream produced a non-byte chunk.",
+            "A request body iterable produced a non-byte chunk.",
           );
         }
-        yield account(result.value);
+        yield account(chunk);
       }
-    } finally {
-      if (!completed) await reader.cancel();
-      reader.releaseLock();
     }
-  } else {
-    for await (const chunk of source) {
-      if (!(chunk instanceof Uint8Array)) {
-        throw new RequestBodySourceError(
-          "A request body iterable produced a non-byte chunk.",
-        );
-      }
-      yield account(chunk);
+  } catch (caught) {
+    if (
+      caught instanceof RequestBodyLimitError ||
+      caught instanceof RequestBodyLengthError ||
+      caught instanceof RequestBodySourceError
+    ) {
+      throw caught;
     }
+    throw new RequestBodySourceError(
+      "The request body source failed.",
+      caught,
+    );
   }
   if (expectedLength !== null && bytesRead !== expectedLength) {
     throw new RequestBodyLengthError(expectedLength, bytesRead);

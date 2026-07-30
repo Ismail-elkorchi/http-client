@@ -222,7 +222,7 @@ export class NodeHttpClient {
         options,
       );
     }
-    visited.add(loopIdentity(currentUrl));
+    visited.add(currentUrl.href);
     let request: RedirectedRequest = {
       method: options.method,
       fields: mergeHttpFields(
@@ -286,7 +286,7 @@ export class NodeHttpClient {
 
       let target: URL;
       try {
-        target = parseUrl(new URL(location, currentUrl));
+        target = redirectTarget(location, currentUrl);
         assertSupportedProtocol(target);
       } catch (caught) {
         observeAttemptCompletion(options, completion);
@@ -310,7 +310,7 @@ export class NodeHttpClient {
         hopIndex,
       };
       const nextRedirects = [...redirects, redirect];
-      if (visited.has(loopIdentity(target))) {
+      if (visited.has(target.href)) {
         observeAttemptCompletion(options, completion);
         return redirectPolicyFailure(
           result,
@@ -391,7 +391,7 @@ export class NodeHttpClient {
       });
       attempts.push(redirectAttempt);
       redirects.push(redirect);
-      visited.add(loopIdentity(target));
+      visited.add(target.href);
       request = requestAfterRedirect(
         currentUrl.href,
         target.href,
@@ -795,10 +795,10 @@ function assertSupportedProtocol(url: URL): void {
   }
 }
 
-function loopIdentity(url: URL): string {
-  const identity = new URL(url.href);
-  identity.hash = "";
-  return identity.href;
+function redirectTarget(location: string, currentUrl: URL): URL {
+  const target = parseUrl(new URL(location, currentUrl));
+  if (!location.includes("#")) target.hash = currentUrl.hash;
+  return target;
 }
 
 function cancelNodeBody(

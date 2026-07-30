@@ -167,6 +167,55 @@ test("enforces streamed upload limits and declared lengths", async () => {
   }
 });
 
+test("classifies request body producer failures", async () => {
+  const server = await listen(
+    http.createServer((request, response) => {
+      request.resume();
+      request.on("end", () => response.end("complete"));
+    }),
+  );
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+  });
+  try {
+    const webStreamFailure = await client.requestBuffered(urlFor(server), {
+      method: "POST",
+      body: {
+        kind: "stream",
+        create: () =>
+          new ReadableStream({
+            pull() {
+              throw new Error("web stream failed");
+            },
+          }),
+      },
+    });
+    assert.equal(webStreamFailure.kind, "failure");
+    assert.equal(
+      webStreamFailure.error.code,
+      "REQUEST_BODY_SOURCE_FAILURE",
+    );
+
+    const iterableFailure = await client.requestBuffered(urlFor(server), {
+      method: "POST",
+      body: {
+        kind: "stream",
+        async *create() {
+          throw new Error("async iterable failed");
+        },
+      },
+    });
+    assert.equal(iterableFailure.kind, "failure");
+    assert.equal(
+      iterableFailure.error.code,
+      "REQUEST_BODY_SOURCE_FAILURE",
+    );
+  } finally {
+    await client.destroy();
+    await closeServer(server);
+  }
+});
+
 test("cancels the upload source when the request deadline expires", async () => {
   let uploadCancelled = false;
   const server = await listen(
@@ -265,6 +314,12 @@ test("builds replayable multipart request bodies", async () => {
     assert.match(payload, /contents/u);
     assert.equal(Number(contentLength), Buffer.byteLength(payload));
     assert.equal(fileStreamCreations, 1);
+    const boundary = contentType?.match(/boundary=(.+)$/u)?.[1];
+    assert.ok(boundary);
+    assert.equal(
+      payload.match(new RegExp(`--${boundary}--`, "gu"))?.length,
+      1,
+    );
 
     const limited = await client.requestBuffered(urlFor(server), {
       method: "POST",
@@ -574,6 +629,65 @@ test("request returns one exchange while fetch follows redirects", async () => {
     assert.equal(fetched.redirects.length, 1);
     assert.equal(await streamText(fetched.body), "target");
     await fetched.completion;
+  } finally {
+    await client.close();
+    await closeServer(server);
+  }
+});
+
+test("inherits redirect fragments only when Location omits one", async () => {
+  let sameResourceRequests = 0;
+  const server = await listen(
+    http.createServer((request, response) => {
+      if (request.url === "/inherit") {
+        response.writeHead(302, { location: "/target" });
+        response.end();
+        return;
+      }
+      if (request.url === "/replace") {
+        response.writeHead(302, { location: "/target#replacement" });
+        response.end();
+        return;
+      }
+      if (request.url === "/same") {
+        sameResourceRequests += 1;
+        if (sameResourceRequests === 1) {
+          response.writeHead(302, { location: "#next" });
+          response.end();
+          return;
+        }
+      }
+      response.end("target");
+    }),
+  );
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+  });
+  try {
+    const inherited = await client.fetch(
+      `${urlFor(server, "/inherit")}#section`,
+    );
+    assert.equal(inherited.kind, "response");
+    assert.equal(new URL(inherited.finalUrl).hash, "#section");
+    inherited.cancel();
+    await inherited.completion;
+
+    const replaced = await client.fetch(
+      `${urlFor(server, "/replace")}#section`,
+    );
+    assert.equal(replaced.kind, "response");
+    assert.equal(new URL(replaced.finalUrl).hash, "#replacement");
+    replaced.cancel();
+    await replaced.completion;
+
+    const sameResource = await client.fetch(
+      `${urlFor(server, "/same")}#before`,
+    );
+    assert.equal(sameResource.kind, "response");
+    assert.equal(new URL(sameResource.finalUrl).hash, "#next");
+    assert.equal(sameResourceRequests, 2);
+    sameResource.cancel();
+    await sameResource.completion;
   } finally {
     await client.close();
     await closeServer(server);
