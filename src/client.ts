@@ -1,460 +1,663 @@
-import { errors as undiciErrors } from "undici";
+import { bufferResult } from "./buffered-response.js";
 import {
-  disposeResponseBody,
-} from "./body.js";
-import { readBody } from "./body-reader.js";
+  resolveClientOptions,
+  resolveRequestOptions,
+  validateRedirectDecision,
+  type ResolvedRequestOptions,
+} from "./configuration.js";
+import { HttpConfigurationError } from "./errors.js";
 import {
-  DEFAULT_HTTP_CLIENT_OPTIONS,
-  DEFAULT_NETWORK_SAFETY,
-  DEFAULT_RESPONSE_LIMITS,
-} from "./defaults.js";
+  awaitWithSignal,
+  PhaseDeadline,
+  RequestDeadline,
+  ResponseHeadersTimeoutError,
+} from "./deadlines.js";
 import {
-  incomingHeaders,
+  applyContentLength,
+  enforceRequestHeadersLimit,
   mergeRequestHeaders,
   requestAfterRedirect,
   type RedirectedRequest,
 } from "./headers.js";
 import { NetworkSafetyPolicy } from "./network-policy.js";
 import {
-  NetworkSafetyError,
-  ProtocolMismatchError,
-  UndiciTransport,
-} from "./transport.js";
+  prepareRequestBody,
+  RequestBodyLimitError,
+} from "./request-body.js";
+import {
+  classifyError,
+  clientError,
+  failureResult,
+  failureFromResponse,
+  redirectFailure,
+} from "./outcomes.js";
+import { createStreamingBody } from "./response-stream.js";
+import { UndiciTransport } from "./transport.js";
 import type {
+  BufferedHttpRequestOptions,
+  BufferedHttpResult,
   HttpClientConfiguration,
   HttpClientOptions,
-  HttpError,
-  HttpErrorCode,
-  HttpFailure,
   HttpRedirect,
   HttpRequestOptions,
-  HttpResult,
-  HttpSuccess,
-  NetworkTimings,
-  ResponseLimits,
-  TlsFacts,
+  StreamingHttpResponse,
+  StreamingHttpResult,
 } from "./types.js";
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-type ExchangeOptions = Omit<HttpRequestOptions, "body"> & {
-  readonly body?: string | Uint8Array | undefined;
-};
-
 export class NodeHttpClient {
   private readonly options: HttpClientOptions;
   private readonly transport: UndiciTransport;
+  private readonly activeResponses = new Set<StreamingHttpResponse>();
+  private readonly activeDeadlines = new Set<RequestDeadline>();
+  private readonly exchangeWaiters = new Set<() => void>();
+  private pendingExchanges = 0;
+  private state: "open" | "closing" | "closed" = "open";
+  private shutdown: Promise<void> | null = null;
 
-  public constructor(
-    configuration: HttpClientConfiguration = {},
-    policy?: NetworkSafetyPolicy,
-  ) {
-    this.options = resolveOptions(configuration);
-    const safety =
-      policy ??
-      new NetworkSafetyPolicy(
-        this.options.networkSafety,
-        this.options.resolver,
-      );
-    this.transport = new UndiciTransport(this.options, safety);
+  public constructor(configuration: HttpClientConfiguration = {}) {
+    this.options = resolveClientOptions(configuration);
+    const policy = new NetworkSafetyPolicy(
+      this.options.networkSafety,
+      this.options.resolver,
+    );
+    this.transport = new UndiciTransport(this.options, policy);
   }
 
   public async request(
     rawUrl: string | URL,
     options: HttpRequestOptions = {},
-  ): Promise<HttpResult> {
-    const deadline = createDeadline(
-      this.options.requestTimeoutMs,
-      options.signal,
+  ): Promise<StreamingHttpResult> {
+    return await this.execute(
+      rawUrl,
+      resolveRequestOptions(options, this.options, false),
+      false,
     );
-    try {
-      return await this.requestExchange(
-        rawUrl,
-        options,
-        deadline.signal,
-        true,
-        options.redirectResponseBody === "discard",
-      );
-    } finally {
-      deadline.dispose();
-    }
   }
 
   public async fetch(
     rawUrl: string | URL,
     options: HttpRequestOptions = {},
-  ): Promise<HttpResult> {
+  ): Promise<StreamingHttpResult> {
+    return await this.execute(
+      rawUrl,
+      resolveRequestOptions(options, this.options, false),
+      true,
+    );
+  }
+
+  public async requestBuffered(
+    rawUrl: string | URL,
+    options: BufferedHttpRequestOptions = {},
+  ): Promise<BufferedHttpResult> {
+    const resolved = resolveRequestOptions(options, this.options, true);
+    return await bufferResult(
+      await this.execute(rawUrl, resolved, false),
+      resolved,
+    );
+  }
+
+  public async fetchBuffered(
+    rawUrl: string | URL,
+    options: BufferedHttpRequestOptions = {},
+  ): Promise<BufferedHttpResult> {
+    const resolved = resolveRequestOptions(options, this.options, true);
+    return await bufferResult(
+      await this.execute(rawUrl, resolved, true),
+      resolved,
+    );
+  }
+
+  public async close(): Promise<void> {
+    if (this.state === "closed") return;
+    if (this.shutdown === null) {
+      this.state = "closing";
+      this.shutdown = this.finishShutdown(this.closeGracefully());
+    }
+    await this.shutdown;
+  }
+
+  public async destroy(reason?: Error): Promise<void> {
+    if (this.state === "closed") return;
+    this.state = "closing";
+    for (const deadline of this.activeDeadlines) deadline.abort(reason);
+    for (const response of this.activeResponses) response.cancel(reason);
+    if (this.shutdown === null) {
+      this.shutdown = this.finishShutdown(
+        this.destroyImmediately(reason),
+      );
+    }
+    await this.shutdown;
+    this.activeResponses.clear();
+  }
+
+  private async execute(
+    rawUrl: string | URL,
+    options: ResolvedRequestOptions,
+    followRedirects: boolean,
+  ): Promise<StreamingHttpResult> {
+    if (this.state !== "open") {
+      throw new HttpClientStateError("The HTTP client is not open.");
+    }
     const startedAt = performance.now();
-    const deadline = createDeadline(
-      this.options.requestTimeoutMs,
+    const deadline = new RequestDeadline(
+      options.timeouts.totalMs,
       options.signal,
     );
+    this.activeDeadlines.add(deadline);
+    this.pendingExchanges += 1;
+    let result: StreamingHttpResult;
+    try {
+      result = followRedirects
+        ? await this.fetchWithRedirects(
+            rawUrl,
+            options,
+            deadline.signal,
+            startedAt,
+          )
+        : await this.requestExchange(
+            rawUrl,
+            {
+              method: options.method,
+              headers: mergeRequestHeaders(
+                this.options.defaultHeaders,
+                options.headers,
+              ),
+              body: options.body,
+            },
+            options,
+            deadline.signal,
+            startedAt,
+            false,
+          );
+    } catch (caught) {
+      this.releaseDeadline(deadline);
+      this.finishExchange();
+      throw caught;
+    }
+    this.finishExchange();
+    if (result.kind === "failure") {
+      this.releaseDeadline(deadline);
+      return result;
+    }
+    const registered = this.registerResponse(result, deadline);
+    return registered;
+  }
+
+  private async fetchWithRedirects(
+    rawUrl: string | URL,
+    options: ResolvedRequestOptions,
+    signal: AbortSignal,
+    startedAt: number,
+  ): Promise<StreamingHttpResult> {
     const redirects: HttpRedirect[] = [];
     const visited = new Set<string>();
     let currentUrl: URL;
     try {
       currentUrl = parseUrl(rawUrl);
     } catch (caught) {
-      deadline.dispose();
-      return failure(
-        "INVALID_URL",
-        "The request URL is invalid.",
-        String(rawUrl),
-        caught,
-        startedAt,
+      const errorUrl = safeErrorUrl(caught);
+      return failureResult(
+        clientError(
+          "INVALID_URL",
+          caught instanceof UrlCredentialsError
+            ? caught.message
+            : "The request URL is invalid.",
+          errorUrl,
+          caught,
+        ),
+        errorUrl,
       );
     }
     visited.add(loopIdentity(currentUrl));
     let request: RedirectedRequest = {
-      method: options.method ?? "GET",
+      method: options.method,
       headers: mergeRequestHeaders(
         this.options.defaultHeaders,
         options.headers,
       ),
       body: options.body,
     };
-    const maxRedirects = options.maxRedirects ?? this.options.maxRedirects;
 
-    try {
-      for (let hopIndex = 0; ; hopIndex += 1) {
-        const result = await this.requestExchange(
-          currentUrl,
-          {
-            ...options,
-            method: request.method,
-            headers: request.headers,
-            body: request.body,
-            redirectResponseBody: "discard",
-          },
-          deadline.signal,
-          false,
-          true,
-        );
-        if (!result.ok) {
-          return withRedirects(result, redirects, startedAt);
-        }
-        const location = result.headers.get("location");
-        if (
-          !REDIRECT_STATUSES.has(result.statusCode ?? 0) ||
-          location === null
-        ) {
-          return withRedirects(result, redirects, startedAt);
-        }
-        if (hopIndex >= maxRedirects) {
-          await disposeResponseBody(result.body);
-          return redirectFailure(
-            "TOO_MANY_REDIRECTS",
-            "Redirect limit exceeded.",
-            currentUrl.href,
-            result,
-            redirects,
-            startedAt,
-          );
-        }
-
-        let target: URL;
-        try {
-          target = new URL(location, currentUrl);
-          assertSupportedProtocol(target);
-        } catch (caught) {
-          await disposeResponseBody(result.body);
-          return redirectFailure(
-            "REDIRECT_TARGET_REJECTED",
-            "The redirect target is invalid.",
-            currentUrl.href,
-            result,
-            redirects,
-            startedAt,
-            caught,
-          );
-        }
-        const redirect: HttpRedirect = {
-          fromUrl: currentUrl.href,
-          toUrl: target.href,
-          statusCode: result.statusCode,
-          hopIndex,
-        };
-        const nextRedirects = [...redirects, redirect];
-        if (visited.has(loopIdentity(target))) {
-          await disposeResponseBody(result.body);
-          return redirectFailure(
-            "REDIRECT_LOOP",
-            "Redirect loop detected.",
-            target.href,
-            result,
-            nextRedirects,
-            startedAt,
-          );
-        }
-        const decision = await options.onRedirect?.({
-          fromUrl: currentUrl.href,
-          toUrl: target.href,
-          statusCode: result.statusCode,
-          hopIndex,
-        });
-        if (decision?.action === "reject") {
-          await disposeResponseBody(result.body);
-          return redirectFailure(
-            "REDIRECT_TARGET_REJECTED",
-            decision.reason,
-            target.href,
-            result,
-            nextRedirects,
-            startedAt,
-          );
-        }
-
-        await disposeResponseBody(result.body);
-        redirects.push(redirect);
-        visited.add(loopIdentity(target));
-        request = requestAfterRedirect(
-          currentUrl.href,
-          target.href,
-          result.statusCode,
-          request,
-        );
-        currentUrl = target;
+    for (let hopIndex = 0; ; hopIndex += 1) {
+      const result = await this.requestExchange(
+        currentUrl,
+        request,
+        options,
+        signal,
+        startedAt,
+        true,
+      );
+      if (result.kind === "failure") {
+        return { ...result, redirects };
       }
-    } finally {
-      deadline.dispose();
-    }
-  }
+      const location = result.headers.get("location");
+      if (
+        !REDIRECT_STATUSES.has(result.statusCode) ||
+        location === null
+      ) {
+        return { ...result, redirects };
+      }
 
-  public async close(): Promise<void> {
-    await this.transport.close();
+      result.cancel();
+      const completion = await result.completion;
+      if (hopIndex >= options.maxRedirects) {
+        return redirectFailure(
+          "TOO_MANY_REDIRECTS",
+          "Redirect limit exceeded.",
+          currentUrl.href,
+          result,
+          completion.transfer,
+          redirects,
+        );
+      }
+
+      let target: URL;
+      try {
+        target = parseUrl(new URL(location, currentUrl));
+        assertSupportedProtocol(target);
+      } catch (caught) {
+        return redirectFailure(
+          "REDIRECT_TARGET_REJECTED",
+          "The redirect target is invalid.",
+          currentUrl.href,
+          result,
+          completion.transfer,
+          redirects,
+          caught,
+        );
+      }
+      const redirect: HttpRedirect = {
+        fromUrl: currentUrl.href,
+        toUrl: target.href,
+        statusCode: result.statusCode,
+        hopIndex,
+      };
+      const nextRedirects = [...redirects, redirect];
+      if (visited.has(loopIdentity(target))) {
+        return redirectFailure(
+          "REDIRECT_LOOP",
+          "Redirect loop detected.",
+          target.href,
+          result,
+          completion.transfer,
+          nextRedirects,
+        );
+      }
+      let decision;
+      try {
+        decision = validateRedirectDecision(
+          options.onRedirect === undefined
+            ? undefined
+            : await awaitWithSignal(
+                Promise.resolve(
+                  options.onRedirect({
+                    fromUrl: currentUrl.href,
+                    toUrl: target.href,
+                    statusCode: result.statusCode,
+                    hopIndex,
+                  }),
+                ),
+                signal,
+              ),
+        );
+      } catch (caught) {
+        if (caught instanceof HttpConfigurationError) throw caught;
+        if (signal.aborted) {
+          return {
+            ...failureFromResponse(
+              result,
+              classifyError(caught, target.href, signal, false),
+              completion.transfer,
+            ),
+            finalUrl: target.href,
+            redirects: nextRedirects,
+          };
+        }
+        return redirectFailure(
+          "REDIRECT_TARGET_REJECTED",
+          "The redirect callback failed.",
+          target.href,
+          result,
+          completion.transfer,
+          nextRedirects,
+          caught,
+        );
+      }
+      if (decision?.action === "reject") {
+        return redirectFailure(
+          "REDIRECT_TARGET_REJECTED",
+          decision.reason,
+          target.href,
+          result,
+          completion.transfer,
+          nextRedirects,
+        );
+      }
+
+      redirects.push(redirect);
+      visited.add(loopIdentity(target));
+      request = requestAfterRedirect(
+        currentUrl.href,
+        target.href,
+        result.statusCode,
+        request,
+      );
+      currentUrl = target;
+    }
   }
 
   private async requestExchange(
     rawUrl: string | URL,
-    options: ExchangeOptions,
+    request: RedirectedRequest,
+    options: ResolvedRequestOptions,
     signal: AbortSignal,
-    mergeDefaults = true,
-    discardRedirectBody = false,
-  ): Promise<HttpResult> {
-    const startedAt = performance.now();
+    requestStartedAt: number,
+    skipRedirectBodyDecoding: boolean,
+  ): Promise<StreamingHttpResult> {
+    const exchangeStartedAt = performance.now();
     let url: URL;
     try {
       url = parseUrl(rawUrl);
     } catch (caught) {
-      return failure(
-        "INVALID_URL",
-        "The request URL is invalid.",
-        String(rawUrl),
-        caught,
-        startedAt,
+      const errorUrl = safeErrorUrl(caught);
+      return failureResult(
+        clientError(
+          "INVALID_URL",
+          caught instanceof UrlCredentialsError
+            ? caught.message
+            : "The request URL is invalid.",
+          errorUrl,
+          caught,
+        ),
+        errorUrl,
       );
     }
     try {
       assertSupportedProtocol(url);
     } catch (caught) {
-      return failure(
-        "UNSUPPORTED_PROTOCOL",
-        "Only HTTP and HTTPS URLs are supported.",
+      return failureResult(
+        clientError(
+          "UNSUPPORTED_PROTOCOL",
+          "Only HTTP and HTTPS URLs are supported.",
+          url.href,
+          caught,
+        ),
         url.href,
-        caught,
-        startedAt,
       );
     }
 
-    const method = options.method ?? "GET";
-    let headers: Readonly<Record<string, string>>;
+    let credentialHeaders: Readonly<Record<string, string>> | undefined;
     try {
-      const credentialHeaders = await options.credentials?.requestHeaders(
+      credentialHeaders =
+        options.credentials === undefined
+          ? undefined
+          : await awaitWithSignal(
+              options.credentials.requestHeaders(url.href),
+              signal,
+            );
+    } catch (caught) {
+      return failureResult(
+        signal.aborted
+          ? classifyError(caught, url.href, signal, false)
+          : clientError(
+              "NETWORK_FAILURE",
+              "Request credentials could not be prepared.",
+              url.href,
+              caught,
+            ),
         url.href,
       );
-      headers = mergeRequestHeaders(
-        mergeDefaults ? this.options.defaultHeaders : undefined,
-        options.headers,
-        credentialHeaders,
+    }
+
+    let preparedBody;
+    try {
+      preparedBody = prepareRequestBody(
+        request.body,
+        options.maxRequestBodyBytes,
       );
     } catch (caught) {
-      return failure(
-        "FETCH_NETWORK_ERROR",
-        "Request headers could not be prepared.",
+      if (caught instanceof RequestBodyLimitError) {
+        return failureResult(
+          clientError(
+            "REQUEST_BODY_TOO_LARGE",
+            caught.message,
+            url.href,
+            caught,
+          ),
+          url.href,
+        );
+      }
+      throw caught;
+    }
+    const mergedHeaders = mergeRequestHeaders(
+      request.headers,
+      credentialHeaders,
+    );
+    const decodingHeaders =
+      options.responseContentDecoding === "decode" &&
+      mergedHeaders["accept-encoding"] === undefined
+        ? {
+            ...mergedHeaders,
+            "accept-encoding": "zstd, br, gzip, deflate",
+          }
+        : mergedHeaders;
+    if (
+      preparedBody.contentType !== null &&
+      decodingHeaders["content-type"] !== undefined
+    ) {
+      throw new HttpConfigurationError(
+        "Multipart content-type is controlled by the HTTP transport.",
+      );
+    }
+    const representationHeaders =
+      preparedBody.contentType === null
+        ? decodingHeaders
+        : {
+            ...decodingHeaders,
+            "content-type": preparedBody.contentType,
+          };
+    const headers = applyContentLength(
+      representationHeaders,
+      request.body !== undefined,
+      preparedBody.contentLength,
+    );
+    try {
+      enforceRequestHeadersLimit(
+        headers,
+        this.options.maxRequestHeadersBytes,
+      );
+    } catch (caught) {
+      return failureResult(
+        classifyError(caught, url.href, signal, false),
         url.href,
-        caught,
-        startedAt,
       );
     }
 
     let response;
-    const firstByteStartedAt = performance.now();
-    const firstByteDeadline = createPhaseDeadline(
-      this.options.firstByteTimeoutMs,
+    const headersDeadline = new PhaseDeadline(
+      options.timeouts.responseHeadersMs,
       signal,
+      new ResponseHeadersTimeoutError(options.timeouts.responseHeadersMs),
     );
     try {
-      response = await this.transport.request(
-        url,
-        method,
+      response = await this.transport.request(url, {
+        method: request.method,
         headers,
-        options.body,
-        firstByteDeadline.signal,
-      );
+        createBody: preparedBody.create,
+        signal: headersDeadline.signal,
+        responseHeadersTimeoutMs: options.timeouts.responseHeadersMs,
+        responseBodyInactivityTimeoutMs:
+          options.timeouts.responseBodyProgressMs,
+        onInformationalResponse:
+          options.onInformationalResponse === undefined
+            ? undefined
+            : (statusCode, headers) => {
+                options.onInformationalResponse?.({ statusCode, headers });
+              },
+      });
     } catch (caught) {
-      if (firstByteDeadline.signal.reason instanceof FirstByteTimeoutError) {
-        return failure(
-          "FETCH_FIRST_BYTE_TIMEOUT",
-          "The response headers timed out.",
-          url.href,
-          caught,
-          startedAt,
+      return failureResult(
+        classifyError(caught, url.href, headersDeadline.signal, false),
+        url.href,
+      );
+    } finally {
+      headersDeadline.dispose();
+    }
+
+    try {
+      if (options.credentials !== undefined) {
+        await awaitWithSignal(
+          options.credentials.captureResponse(
+            url.href,
+            new Headers(response.headers),
+          ),
+          signal,
         );
       }
-      return failureFromCaught(caught, url.href, signal, startedAt);
-    } finally {
-      firstByteDeadline.dispose();
-    }
-    const firstByteMs = performance.now() - firstByteStartedAt;
-    const responseHeaders = incomingHeaders(response.headers);
-    try {
-      await options.credentials?.captureResponse(url.href, responseHeaders);
     } catch (caught) {
-      cancelResponseBody(response.body);
-      return failure(
-        "FETCH_NETWORK_ERROR",
-        "Response credentials could not be captured.",
+      cancelNodeBody(response.body, caught);
+      return failureResult(
+        signal.aborted
+          ? classifyError(caught, url.href, signal, false)
+          : clientError(
+              "NETWORK_FAILURE",
+              "Response credentials could not be captured.",
+              url.href,
+              caught,
+            ),
         url.href,
-        caught,
-        startedAt,
         response.statusCode,
-        responseHeaders,
-        response.facts,
+        response.headers,
+        response.connection,
+        null,
+        response.statusMessage,
       );
     }
 
-    if (
-      discardRedirectBody &&
-      REDIRECT_STATUSES.has(response.statusCode) &&
-      responseHeaders.has("location")
-    ) {
-      cancelResponseBody(response.body);
-      const totalMs = performance.now() - startedAt;
-      return success(
-        url.href,
-        response.statusCode,
-        responseHeaders,
-        { kind: "memory", bytes: new Uint8Array(), size: 0 },
-        0,
-        0,
-        response.facts,
-        {
-          dnsMs: response.dnsMs,
-          connectMs: null,
-          tlsMs: null,
-          firstByteMs,
-          bodyMs: 0,
-          totalMs,
-        },
-        startedAt,
-      );
-    }
-
-    const bodyStartedAt = performance.now();
-    const body = await readBody(
-      response.body,
-      response.headers["content-encoding"],
-      resolveLimits(this.options.responseLimits, options.responseLimits),
-      signal,
-    );
-    const timings: NetworkTimings = {
+    const headTimings = {
       dnsMs: response.dnsMs,
-      connectMs: null,
-      tlsMs: null,
-      firstByteMs,
-      bodyMs: performance.now() - bodyStartedAt,
-      totalMs: performance.now() - startedAt,
+      responseHeadersMs: performance.now() - exchangeStartedAt,
     };
-    if (!body.ok) {
-      const code =
-        signal.aborted && isDeadlineReason(signal.reason)
-          ? "FETCH_TIMEOUT"
-          : body.code;
-      return failure(
-        code,
-        body.message,
+    let streamingBody;
+    const isFollowedRedirect =
+      skipRedirectBodyDecoding &&
+      REDIRECT_STATUSES.has(response.statusCode) &&
+      response.headers.has("location");
+    try {
+      streamingBody = createStreamingBody({
+        source: response.body,
+        contentEncoding:
+          options.responseContentDecoding === "decode" &&
+          !isFollowedRedirect &&
+          responseHasContent(request.method, response.statusCode)
+            ? response.headers.get("content-encoding") ?? undefined
+            : undefined,
+        limits: options.responseTransferLimits,
+        responseBodyProgressTimeoutMs:
+          options.timeouts.responseBodyProgressMs,
+        signal,
+        requestStartedAt,
+        headTimings,
+        requestBodyBytesSent: response.requestBodyBytesSent,
+        trailers: response.trailers,
+        classifyFailure: (caught, decoding) =>
+          classifyError(caught, url.href, signal, decoding),
+      });
+    } catch (caught) {
+      cancelNodeBody(response.body, caught);
+      return failureResult(
+        classifyError(caught, url.href, signal, false),
         url.href,
-        body.cause,
-        startedAt,
         response.statusCode,
-        responseHeaders,
-        response.facts,
-        body.wireBytesRead,
-        body.decodedBytesRead,
-        timings,
+        response.headers,
+        response.connection,
+        null,
+        response.statusMessage,
       );
     }
-    return success(
-      url.href,
-      response.statusCode,
-      responseHeaders,
-      body.body,
-      body.wireBytesRead,
-      body.decodedBytesRead,
-      response.facts,
-      timings,
-      startedAt,
-    );
+    return {
+      kind: "response",
+      statusCode: response.statusCode,
+      statusMessage: response.statusMessage,
+      finalUrl: url.href,
+      headers: response.headers,
+      redirects: [],
+      connection: response.connection,
+      headTimings,
+      body: streamingBody.body,
+      completion: streamingBody.completion,
+      cancel: streamingBody.cancel,
+    };
   }
-}
 
-function resolveOptions(
-  configuration: HttpClientConfiguration,
-): HttpClientOptions {
-  const options: HttpClientOptions = {
-    ...DEFAULT_HTTP_CLIENT_OPTIONS,
-    ...configuration,
-    responseLimits: resolveLimits(
-      DEFAULT_RESPONSE_LIMITS,
-      configuration.responseLimits,
-    ),
-    networkSafety: {
-      ...DEFAULT_NETWORK_SAFETY,
-      ...configuration.networkSafety,
-    },
-    defaultHeaders: mergeRequestHeaders(configuration.defaultHeaders),
-  };
-  for (const [name, value, minimum] of [
-    ["requestTimeoutMs", options.requestTimeoutMs, 1],
-    ["connectTimeoutMs", options.connectTimeoutMs, 1],
-    ["firstByteTimeoutMs", options.firstByteTimeoutMs, 1],
-    ["maxRedirects", options.maxRedirects, 0],
-    ["maxConnectionsPerOrigin", options.maxConnectionsPerOrigin, 1],
-    ["maxOrigins", options.maxOrigins, 1],
-  ] as const) {
-    if (!Number.isSafeInteger(value) || value < minimum) {
-      throw new TypeError(
-        `${name} must be a safe integer greater than or equal to ${String(minimum)}.`,
-      );
+  private registerResponse(
+    response: StreamingHttpResponse,
+    deadline: RequestDeadline,
+  ): StreamingHttpResponse {
+    this.activeResponses.add(response);
+    void response.completion.then(() => {
+      this.activeResponses.delete(response);
+      this.releaseDeadline(deadline);
+    });
+    return response;
+  }
+
+  private async finishShutdown(operation: Promise<void>): Promise<void> {
+    try {
+      await operation;
+    } finally {
+      this.state = "closed";
     }
   }
-  validateLimits(options.responseLimits);
-  return options;
-}
 
-function resolveLimits(
-  defaults: ResponseLimits,
-  overrides: Partial<ResponseLimits> | undefined,
-): ResponseLimits {
-  const limits = { ...defaults, ...overrides };
-  validateLimits(limits);
-  return limits;
-}
-
-function validateLimits(limits: ResponseLimits): void {
-  for (const [name, value] of [
-    ["maxCompressedBytes", limits.maxCompressedBytes],
-    ["maxDecompressedBytes", limits.maxDecompressedBytes],
-    ["memoryThresholdBytes", limits.memoryThresholdBytes],
-  ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new TypeError(`${name} must be a non-negative safe integer.`);
-    }
+  private async closeGracefully(): Promise<void> {
+    await this.waitForExchanges();
+    await this.transport.close();
   }
+
+  private async destroyImmediately(reason?: Error): Promise<void> {
+    await this.waitForExchanges();
+    await this.transport.destroy(reason);
+  }
+
+  private releaseDeadline(deadline: RequestDeadline): void {
+    this.activeDeadlines.delete(deadline);
+    deadline.dispose();
+  }
+
+  private finishExchange(): void {
+    this.pendingExchanges -= 1;
+    if (this.pendingExchanges !== 0) return;
+    for (const resolve of this.exchangeWaiters) resolve();
+    this.exchangeWaiters.clear();
+  }
+
+  private async waitForExchanges(): Promise<void> {
+    if (this.pendingExchanges === 0) return;
+    await new Promise<void>((resolve) => {
+      this.exchangeWaiters.add(resolve);
+    });
+  }
+}
+
+export class HttpClientStateError extends Error {
+  public override readonly name = "HttpClientStateError";
 }
 
 function parseUrl(value: string | URL): URL {
-  return value instanceof URL ? new URL(value.href) : new URL(value);
+  if (typeof value !== "string" && !(value instanceof URL)) {
+    throw new TypeError("Request URL must be a string or URL.");
+  }
+  const url = value instanceof URL ? new URL(value.href) : new URL(value);
+  if (url.username !== "" || url.password !== "") {
+    const safeUrl = new URL(url.href);
+    safeUrl.username = "";
+    safeUrl.password = "";
+    throw new UrlCredentialsError(safeUrl.href);
+  }
+  return url;
 }
 
 function assertSupportedProtocol(url: URL): void {
@@ -469,296 +672,43 @@ function loopIdentity(url: URL): string {
   return identity.href;
 }
 
-function createDeadline(
-  timeoutMs: number,
-  externalSignal: AbortSignal | undefined,
-): {
-  readonly signal: AbortSignal;
-  readonly dispose: () => void;
-} {
-  const timeout = AbortSignal.timeout(timeoutMs);
-  return {
-    signal:
-      externalSignal === undefined
-        ? timeout
-        : AbortSignal.any([externalSignal, timeout]),
-    dispose: () => {},
-  };
-}
-
-function createPhaseDeadline(
-  timeoutMs: number,
-  externalSignal: AbortSignal,
-): {
-  readonly signal: AbortSignal;
-  readonly dispose: () => void;
-} {
-  const controller = new AbortController();
-  const abortFromExternal = (): void => {
-    controller.abort(externalSignal.reason);
-  };
-  if (externalSignal.aborted) abortFromExternal();
-  else externalSignal.addEventListener("abort", abortFromExternal, {
-    once: true,
-  });
-  const timer = setTimeout(() => {
-    controller.abort(new FirstByteTimeoutError());
-  }, timeoutMs);
-  return {
-    signal: controller.signal,
-    dispose: () => {
-      clearTimeout(timer);
-      externalSignal.removeEventListener("abort", abortFromExternal);
-    },
-  };
-}
-
-class FirstByteTimeoutError extends Error {
-  public override readonly name = "FirstByteTimeoutError";
-
-  public constructor() {
-    super("The response headers timed out.");
-  }
-}
-
-function isDeadlineReason(value: unknown): boolean {
-  return value instanceof DOMException && value.name === "TimeoutError";
-}
-
-function failureFromCaught(
+function cancelNodeBody(
+  body: { on(event: "error", listener: () => undefined): unknown; destroy(reason?: Error): unknown },
   caught: unknown,
-  url: string,
-  signal: AbortSignal,
-  startedAt: number,
-): HttpFailure {
-  if (caught instanceof NetworkSafetyError) {
-    const code =
-      !caught.resolution.decision.allowed &&
-      caught.resolution.decision.rejectionKind === "dns"
-        ? "DNS_ERROR"
-        : "NETWORK_SAFETY_REJECTED";
-    return failure(
-      code,
-      caught.message,
-      url,
-      caught,
-      startedAt,
-    );
-  }
-  if (caught instanceof ProtocolMismatchError) {
-    return failure(
-      "PROTOCOL_MISMATCH",
-      caught.message,
-      url,
-      caught,
-      startedAt,
-    );
-  }
-  if (signal.aborted) {
-    return failure(
-      isDeadlineReason(signal.reason) ? "FETCH_TIMEOUT" : "FETCH_ABORTED",
-      isDeadlineReason(signal.reason)
-        ? "The request deadline expired."
-        : "The request was aborted.",
-      url,
-      caught,
-      startedAt,
-    );
-  }
-  if (caught instanceof undiciErrors.ConnectTimeoutError) {
-    return failure(
-      "FETCH_CONNECT_TIMEOUT",
-      "The connection timed out.",
-      url,
-      caught,
-      startedAt,
-    );
-  }
-  if (caught instanceof undiciErrors.HeadersTimeoutError) {
-    return failure(
-      "FETCH_FIRST_BYTE_TIMEOUT",
-      "The response headers timed out.",
-      url,
-      caught,
-      startedAt,
-    );
-  }
-  const code = errorCode(caught);
-  if (code?.startsWith("ERR_TLS_") === true || code === "DEPTH_ZERO_SELF_SIGNED_CERT") {
-    return failure("TLS_ERROR", "TLS negotiation failed.", url, caught, startedAt);
-  }
-  return failure(
-    "FETCH_NETWORK_ERROR",
-    "The HTTP request failed.",
-    url,
-    caught,
-    startedAt,
-  );
-}
-
-function errorCode(value: unknown): string | null {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("code" in value)
-  ) {
-    return null;
-  }
-  return typeof value.code === "string" ? value.code : null;
-}
-
-function failure(
-  code: HttpErrorCode,
-  message: string,
-  url: string,
-  cause: unknown,
-  startedAt: number,
-  statusCode: number | null = null,
-  headers: Headers = new Headers(),
-  facts: {
-    readonly remoteAddress: string | null;
-    readonly protocol: HttpFailure["protocol"];
-    readonly tls: TlsFacts | null;
-  } = { remoteAddress: null, protocol: "unknown", tls: null },
-  wireBytesRead: number | null = null,
-  decodedBytesRead: number | null = null,
-  timings?: NetworkTimings,
-): HttpFailure {
-  const totalMs = performance.now() - startedAt;
-  const error: HttpError = {
-    code,
-    message,
-    url,
-    retryable: retryable(code),
-    cause,
-  };
-  return {
-    ok: false,
-    statusCode,
-    finalUrl: url,
-    headers,
-    redirects: [],
-    responseTimeMs: totalMs,
-    wireBytesRead,
-    decodedBytesRead,
-    remoteAddress: facts.remoteAddress,
-    protocol: facts.protocol,
-    timings: timings ?? emptyTimings(totalMs),
-    tls: facts.tls,
-    body: null,
-    error,
-  };
-}
-
-function success(
-  url: string,
-  statusCode: number,
-  headers: Headers,
-  body: HttpSuccess["body"],
-  wireBytesRead: number,
-  decodedBytesRead: number,
-  facts: {
-    readonly remoteAddress: string | null;
-    readonly protocol: HttpSuccess["protocol"];
-    readonly tls: TlsFacts | null;
-  },
-  timings: NetworkTimings,
-  startedAt: number,
-): HttpSuccess {
-  return {
-    ok: true,
-    statusCode,
-    finalUrl: url,
-    headers,
-    redirects: [],
-    responseTimeMs: performance.now() - startedAt,
-    wireBytesRead,
-    decodedBytesRead,
-    remoteAddress: facts.remoteAddress,
-    protocol: facts.protocol,
-    timings,
-    tls: facts.tls,
-    body,
-    error: null,
-  };
-}
-
-function withRedirects(
-  result: HttpResult,
-  redirects: readonly HttpRedirect[],
-  startedAt: number,
-): HttpResult {
-  return {
-    ...result,
-    redirects,
-    responseTimeMs: performance.now() - startedAt,
-    timings: {
-      ...result.timings,
-      totalMs: performance.now() - startedAt,
-    },
-  };
-}
-
-function redirectFailure(
-  code: "REDIRECT_LOOP" | "REDIRECT_TARGET_REJECTED" | "TOO_MANY_REDIRECTS",
-  message: string,
-  url: string,
-  previous: HttpSuccess,
-  redirects: readonly HttpRedirect[],
-  startedAt: number,
-  cause: unknown = null,
-): HttpFailure {
-  const result = failure(
-    code,
-    message,
-    url,
-    cause,
-    startedAt,
-    previous.statusCode,
-    previous.headers,
-    previous,
-    previous.wireBytesRead,
-    previous.decodedBytesRead,
-    previous.timings,
-  );
-  const totalMs = performance.now() - startedAt;
-  return {
-    ...result,
-    redirects,
-    responseTimeMs: totalMs,
-    timings: { ...result.timings, totalMs },
-  };
-}
-
-function emptyTimings(totalMs: number): NetworkTimings {
-  return {
-    dnsMs: null,
-    connectMs: null,
-    tlsMs: null,
-    firstByteMs: null,
-    bodyMs: null,
-    totalMs,
-  };
-}
-
-function retryable(code: HttpErrorCode): boolean {
-  return new Set<HttpErrorCode>([
-    "DNS_ERROR",
-    "TLS_ERROR",
-    "FETCH_TIMEOUT",
-    "FETCH_CONNECT_TIMEOUT",
-    "FETCH_FIRST_BYTE_TIMEOUT",
-    "FETCH_NETWORK_ERROR",
-  ]).has(code);
-}
-
-function cancelResponseBody(
-  body: { on(event: "error", listener: () => undefined): unknown; destroy(): unknown },
 ): void {
-  body.on("error", ignoreError);
-  body.destroy();
+  body.on("error", ignoreFailure);
+  body.destroy(caught instanceof Error ? caught : undefined);
 }
 
-function ignoreError(): undefined {
+function ignoreFailure(): undefined {
   return undefined;
+}
+
+function responseHasContent(
+  method: string,
+  statusCode: number,
+): boolean {
+  return (
+    method !== "HEAD" &&
+    (statusCode < 100 || statusCode >= 200) &&
+    statusCode !== 204 &&
+    statusCode !== 205 &&
+    statusCode !== 304
+  );
+}
+
+class UrlCredentialsError extends Error {
+  public override readonly name = "UrlCredentialsError";
+  public readonly safeUrl: string;
+
+  public constructor(safeUrl: string) {
+    super(
+      "Request URL credentials are not accepted; use request headers or a credential provider.",
+    );
+    this.safeUrl = safeUrl;
+  }
+}
+
+function safeErrorUrl(caught: unknown): string {
+  return caught instanceof UrlCredentialsError ? caught.safeUrl : "";
 }

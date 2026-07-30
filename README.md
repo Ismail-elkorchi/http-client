@@ -1,11 +1,10 @@
 # HTTP Client
 
-A bounded HTTP client for Node.js. It provides address-pinned network safety,
-HTTP/1.1 and HTTP/2 through Undici, raw-wire byte limits, layered content
-decoding, file-backed response bodies, redirect handling, and connection/TLS
-facts.
+A streaming HTTP/1.1 and HTTP/2 client for Node.js 24 or newer.
 
-Requires Node.js 24 or newer.
+It provides bounded uploads and responses, redirects, content decoding,
+address-pinned DNS resolution, explicit proxy and TLS configuration, temporary
+file storage, cancellation, trailers, and connection facts.
 
 ## Install
 
@@ -13,60 +12,125 @@ Requires Node.js 24 or newer.
 npm install @ismail-elkorchi/http-client
 ```
 
-## Use
+## Stream a response
 
 ```ts
-import {
-  NodeHttpClient,
-  readResponseBody,
-} from "@ismail-elkorchi/http-client";
+import { NodeHttpClient } from "@ismail-elkorchi/http-client";
 
-const client = new NodeHttpClient({
-  defaultHeaders: { "user-agent": "my-crawler/1.0" },
-  responseLimits: {
-    maxCompressedBytes: 10 * 1024 * 1024,
-    maxDecompressedBytes: 50 * 1024 * 1024,
-  },
-});
+const client = new NodeHttpClient();
 
 try {
   const result = await client.fetch("https://example.com/");
-  if (!result.ok) {
+  if (result.kind === "failure") {
     console.error(result.error.code, result.error.message);
   } else {
-    const bytes = await readResponseBody(result.body);
-    console.log(result.statusCode, result.protocol, bytes.byteLength);
+    const bytes = new Uint8Array(await new Response(result.body).arrayBuffer());
+    const completion = await result.completion;
+
+    if (completion.kind === "complete") {
+      console.log(result.statusCode, bytes.byteLength);
+      console.log(completion.transfer.wireBytesReceived);
+    } else if (completion.kind === "failure") {
+      console.error(completion.error.code, completion.error.message);
+    }
   }
 } finally {
   await client.close();
 }
 ```
 
-Network safety allows public addresses by default and rejects localhost,
-private, reserved, documentation, and mixed public/non-public DNS answers.
-Callers that intentionally access a private network must opt in:
+`request()` performs one exchange. `fetch()` follows redirects. Both return
+after the response headers arrive and keep the total deadline active until the
+body completes or is cancelled.
+
+Every response body must be consumed or cancelled. `destroy()` cancels all
+active responses when graceful shutdown is not appropriate.
+
+## Buffer a response
 
 ```ts
+import {
+  NodeHttpClient,
+  disposeResponseBody,
+  readResponseBody,
+} from "@ismail-elkorchi/http-client";
+
 const client = new NodeHttpClient({
-  networkSafety: { allowPrivateNetworks: true },
+  responseStorage: {
+    memoryThresholdBytes: 512 * 1024,
+  },
+});
+
+try {
+  const result = await client.fetchBuffered("https://example.com/");
+  if (result.kind === "response") {
+    try {
+      const bytes = await readResponseBody(result.body);
+      console.log(bytes.byteLength);
+    } finally {
+      await disposeResponseBody(result.body);
+    }
+  }
+} finally {
+  await client.close();
+}
+```
+
+Responses larger than `memoryThresholdBytes` are stored in private temporary
+files. Wire and decoded byte limits apply before storage.
+
+## Send a request body
+
+Request bodies are discriminated and replayable across redirects:
+
+```ts
+await client.fetch("https://example.com/upload", {
+  method: "POST",
+  body: {
+    kind: "stream",
+    contentLength: 3,
+    create: () =>
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.close();
+        },
+      }),
+  },
 });
 ```
 
-`request()` performs one HTTP exchange. `fetch()` follows redirects, applies a
-single end-to-end deadline, strips credentials across origins, applies standard
-POST redirect rewrites, captures intermediate credentials through a
-`CredentialProvider`, and cancels unused redirect bodies.
+The other body kinds are `text`, `bytes`, and `multipart`.
 
-Successful results contain a `ResponseBody` discriminated union. Small bodies
-are held in memory; larger bodies are written to private temporary files. Use
-`readResponseBody()`, `responseBodyPrefix()`, `responseBodyStream()`, and
-`disposeResponseBody()` instead of depending on storage details.
+## Network boundaries
+
+Public addresses are permitted by default. Local, private, reserved,
+documentation, and mixed public/non-public DNS answers are rejected.
+
+```ts
+const localClient = new NodeHttpClient({
+  networkSafety: { allowLocalhost: true },
+});
+```
+
+An HTTP proxy resolves and connects to the target on behalf of the client, so
+target address pinning cannot be guaranteed. Proxy configuration therefore
+requires `networkSafety.enabled` to be `false`.
+
+```ts
+const proxyClient = new NodeHttpClient({
+  networkSafety: { enabled: false },
+  proxy: { url: "http://proxy.example:8080/" },
+});
+```
+
+Retry policy, cookies, caches, rate limits, and application sessions belong in
+consumer adapters.
 
 ## Development
 
 ```sh
 npm ci
+npm run check
 npm test
 ```
-
-`npm run check` runs strict TypeScript and ESLint checks.

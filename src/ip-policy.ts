@@ -1,4 +1,5 @@
 import { isIP } from "node:net";
+import { HttpConfigurationError } from "./errors.js";
 import type {
   NetworkSafetyDecision,
   NetworkSafetyOptions,
@@ -59,6 +60,25 @@ export function decideIp(
   rawIp: string,
   options: NetworkSafetyOptions,
 ): NetworkSafetyDecision {
+  if (typeof rawIp !== "string") {
+    throw new HttpConfigurationError("IP address must be a string.");
+  }
+  if (
+    typeof options !== "object" ||
+    options === null ||
+    typeof options.enabled !== "boolean" ||
+    typeof options.allowLocalhost !== "boolean" ||
+    typeof options.allowPrivateNetworks !== "boolean"
+  ) {
+    throw new HttpConfigurationError(
+      "Network safety options are invalid.",
+    );
+  }
+  if (!options.enabled) {
+    return isIP(rawIp) === 0
+      ? denied("Invalid IP address", rawIp)
+      : allowed(rawIp);
+  }
   const mapped = mappedIpv4(rawIp);
   if (mapped !== null) return decideIpv4(mapped, rawIp, options);
   const family = isIP(rawIp);

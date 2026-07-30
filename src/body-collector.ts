@@ -3,25 +3,23 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
+import { RESPONSE_BODY_BRAND } from "./body-brand.js";
 import { ensurePrivateDirectory, openPrivateFile } from "./private-files.js";
 import type { ResponseBody } from "./types.js";
 
 export class BodyCollector extends Writable {
   public bytesRead = 0;
   private readonly chunks: Buffer[] = [];
-  private readonly maxBytes: number;
   private readonly memoryThresholdBytes: number;
   private readonly directory: string;
   private fileHandle: fs.FileHandle | null = null;
   private filePath: string | null = null;
 
   public constructor(
-    maxBytes: number,
     memoryThresholdBytes: number,
     spoolDirectory: string | null,
   ) {
     super();
-    this.maxBytes = maxBytes;
     this.memoryThresholdBytes = memoryThresholdBytes;
     this.directory =
       spoolDirectory ?? path.join(os.tmpdir(), "http-client-bodies");
@@ -54,15 +52,36 @@ export class BodyCollector extends Writable {
   }
 
   public async discard(): Promise<void> {
-    await this.closeFile();
-    if (this.filePath !== null) await fs.rm(this.filePath, { force: true });
+    let closeFailure: unknown = null;
+    let removalFailure: unknown = null;
+    try {
+      await this.closeFile();
+    } catch (caught) {
+      closeFailure = caught;
+    }
+    if (this.filePath !== null) {
+      try {
+        await fs.rm(this.filePath, { force: true });
+      } catch (caught) {
+        removalFailure = caught;
+      }
+    }
     this.filePath = null;
     this.chunks.length = 0;
+    if (closeFailure !== null || removalFailure !== null) {
+      throw new AggregateError(
+        [closeFailure, removalFailure].filter(
+          (failure) => failure !== null,
+        ),
+        "Response body cleanup failed.",
+      );
+    }
   }
 
   public body(): ResponseBody {
     if (this.filePath !== null) {
       return {
+        [RESPONSE_BODY_BRAND]: true,
         kind: "file",
         path: this.filePath,
         size: this.bytesRead,
@@ -70,14 +89,16 @@ export class BodyCollector extends Writable {
       };
     }
     const bytes = Buffer.concat(this.chunks, this.bytesRead);
-    return { kind: "memory", bytes, size: bytes.byteLength };
+    return {
+      [RESPONSE_BODY_BRAND]: true,
+      kind: "memory",
+      bytes,
+      size: bytes.byteLength,
+    };
   }
 
   private async writeChunk(chunk: Buffer): Promise<void> {
     this.bytesRead += chunk.byteLength;
-    if (this.bytesRead > this.maxBytes) {
-      throw new BodyLimitError("decompressed", this.maxBytes);
-    }
     try {
       if (
         this.fileHandle === null &&
@@ -87,9 +108,8 @@ export class BodyCollector extends Writable {
         return;
       }
       const handle = await this.ensureFile();
-      await handle.write(chunk);
+      await writeAll(handle, chunk);
     } catch (caught) {
-      if (caught instanceof BodyLimitError) throw caught;
       throw new BodyStorageError("Response body storage failed.", caught);
     }
   }
@@ -102,7 +122,7 @@ export class BodyCollector extends Writable {
       `${process.pid}-${randomUUID()}.body`,
     );
     this.fileHandle = await openPrivateFile(this.filePath);
-    for (const chunk of this.chunks) await this.fileHandle.write(chunk);
+    for (const chunk of this.chunks) await writeAll(this.fileHandle, chunk);
     this.chunks.length = 0;
     return this.fileHandle;
   }
@@ -114,13 +134,18 @@ export class BodyCollector extends Writable {
   }
 }
 
-export class BodyLimitError extends Error {
-  public override readonly name = "BodyLimitError";
-  public readonly kind: "compressed" | "decompressed";
-
-  public constructor(kind: "compressed" | "decompressed", limit: number) {
-    super(`${kind} response body exceeded ${String(limit)} bytes.`);
-    this.kind = kind;
+async function writeAll(handle: fs.FileHandle, bytes: Buffer): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const result = await handle.write(
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+    );
+    if (result.bytesWritten === 0) {
+      throw new Error("Response body file write made no progress.");
+    }
+    offset += result.bytesWritten;
   }
 }
 

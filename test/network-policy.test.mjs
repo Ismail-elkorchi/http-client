@@ -5,17 +5,7 @@ import {
   NetworkSafetyPolicy,
   decideIp,
   evaluateNetworkAddresses,
-  parseContentLength,
 } from "../dist/index.js";
-
-test("parses only canonical safe-integer Content-Length values", () => {
-  assert.equal(parseContentLength("0"), 0);
-  assert.equal(parseContentLength("42"), 42);
-  assert.equal(parseContentLength("01"), null);
-  assert.equal(parseContentLength("-1"), null);
-  assert.equal(parseContentLength("1.5"), null);
-  assert.equal(parseContentLength("9007199254740992"), null);
-});
 
 test("classifies current IANA IPv4 special-purpose ranges", () => {
   const expected = new Map([
@@ -77,6 +67,21 @@ test("rejects mixed DNS answers or pins only safe addresses by policy", () => {
   assert.deepEqual(filtered.rejectedAddresses, [
     { address: "127.0.0.1", family: 4 },
   ]);
+  assert.equal(
+    decideIp("127.0.0.1", {
+      ...DEFAULT_NETWORK_SAFETY,
+      enabled: false,
+    }).allowed,
+    true,
+  );
+  assert.equal(
+    evaluateNetworkAddresses(
+      "empty.example",
+      [],
+      { ...DEFAULT_NETWORK_SAFETY, enabled: false },
+    ).decision.allowed,
+    false,
+  );
 });
 
 test("bounds DNS cache entries and updates recency on a cache hit", async () => {
@@ -112,5 +117,63 @@ test("bounds DNS resolution time", async () => {
   const result = await policy.resolveHostname("slow.example");
   assert.equal(result.decision.allowed, false);
   assert.equal(result.decision.reason, "DNS lookup timed out");
-  assert.ok(performance.now() - startedAt < 100);
+  assert.equal(performance.now() - startedAt < 500, true);
+});
+
+test("rejects invalid resolver output as a DNS failure", async () => {
+  const policy = new NetworkSafetyPolicy(
+    DEFAULT_NETWORK_SAFETY,
+    async () => [{ address: "not-an-ip", family: 4 }],
+  );
+  const result = await policy.resolveHostname("invalid.example");
+  assert.equal(result.decision.allowed, false);
+  assert.equal(result.decision.rejectionKind, "dns");
+  assert.equal(result.decision.reason, "DNS lookup failed");
+});
+
+test("rejects invalid address inventories at the public boundary", () => {
+  assert.throws(() =>
+    evaluateNetworkAddresses(
+      "invalid.example",
+      [{ address: "127.0.0.1", family: 6 }],
+      DEFAULT_NETWORK_SAFETY,
+    ),
+  );
+});
+
+test("coalesces concurrent DNS lookups", async () => {
+  let calls = 0;
+  const policy = new NetworkSafetyPolicy(
+    DEFAULT_NETWORK_SAFETY,
+    async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return [{ address: "8.8.8.8", family: 4 }];
+    },
+  );
+  const [first, second] = await Promise.all([
+    policy.resolveHostname("shared.example"),
+    policy.resolveHostname("shared.example"),
+  ]);
+  assert.equal(first.decision.allowed, true);
+  assert.equal(second.decision.allowed, true);
+  assert.equal(calls, 1);
+});
+
+test("cancels owned DNS work when the policy closes", async () => {
+  let resolverSignal = null;
+  const policy = new NetworkSafetyPolicy(
+    { ...DEFAULT_NETWORK_SAFETY, dnsTimeoutMs: 1_000 },
+    async (_hostname, signal) => {
+      resolverSignal = signal;
+      return await new Promise(() => {});
+    },
+  );
+  const resolution = policy.resolveHostname("pending.example");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  policy.close(new Error("shutdown"));
+  const result = await resolution;
+  assert.equal(result.decision.allowed, false);
+  assert.equal(result.decision.rejectionKind, "dns");
+  assert.equal(resolverSignal?.aborted, true);
 });

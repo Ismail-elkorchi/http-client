@@ -1,9 +1,11 @@
 {
   "name": "@ismail-elkorchi/http-client",
   "version": "0.1.0",
-  "description": "Bounded HTTP client primitives for Node.js.",
+  "description": "Strict streaming HTTP client for Node.js.",
   "type": "module",
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/connection-observer.js"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -25,7 +27,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint \"src/**/*.ts\"",
     "check": "npm run typecheck && npm run lint",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "test": "npm run build && node --test test/*.test.mjs && tsc -p test/types/tsconfig.json && node scripts/verify-package.mjs",
     "prepack": "npm run check && npm test"
   },
   "dependencies": {

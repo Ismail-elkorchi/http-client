@@ -1,15 +1,24 @@
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
-import type { Readable } from "node:stream";
-import type { ResponseBody } from "./types.js";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { BodyCollector } from "./body-collector.js";
+import { RESPONSE_BODY_BRAND } from "./body-brand.js";
+import { HttpConfigurationError } from "./errors.js";
+import type {
+  ResponseBody,
+  ResponseStorageOptions,
+} from "./types.js";
 
 export function responseBodySize(body: ResponseBody | null): number {
+  if (body !== null) validateResponseBody(body);
   return body?.size ?? 0;
 }
 
 export async function readResponseBody(
   body: ResponseBody,
 ): Promise<Uint8Array> {
+  validateResponseBody(body);
   return body.kind === "memory" ? body.bytes : await fs.readFile(body.path);
 }
 
@@ -17,6 +26,7 @@ export async function responseBodyPrefix(
   body: ResponseBody,
   maxBytes: number,
 ): Promise<Uint8Array> {
+  validateResponseBody(body);
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
     throw new TypeError("maxBytes must be a non-negative safe integer.");
   }
@@ -34,6 +44,7 @@ export async function responseBodyPrefix(
 export function responseBodyStream(
   body: ResponseBody,
 ): ReadableStream<Uint8Array> {
+  validateResponseBody(body);
   if (body.kind === "memory") {
     return new ReadableStream<Uint8Array>({
       start(controller) {
@@ -48,8 +59,50 @@ export function responseBodyStream(
 export async function disposeResponseBody(
   body: ResponseBody | null,
 ): Promise<void> {
+  if (body !== null) validateResponseBody(body);
   if (body?.kind === "file" && body.temporary) {
     await fs.rm(body.path, { force: true });
+  }
+}
+
+function validateResponseBody(body: ResponseBody): void {
+  if (!hasResponseBodyBrand(body)) {
+    throw new HttpConfigurationError(
+      "Response body was not created by this package.",
+    );
+  }
+}
+
+function hasResponseBodyBrand(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    RESPONSE_BODY_BRAND in value &&
+    value[RESPONSE_BODY_BRAND] === true
+  );
+}
+
+export async function storeResponseBody(
+  source: ReadableStream<Uint8Array>,
+  storage: ResponseStorageOptions,
+): Promise<ResponseBody> {
+  const collector = new BodyCollector(
+    storage.memoryThresholdBytes,
+    storage.spoolDirectory,
+  );
+  try {
+    await pipeline(Readable.from(iterateWebStream(source)), collector);
+    return collector.body();
+  } catch (caught) {
+    try {
+      await collector.discard();
+    } catch (discardFailure) {
+      throw new AggregateError(
+        [caught, discardFailure],
+        "Response body storage and cleanup failed.",
+      );
+    }
+    throw caught;
   }
 }
 
@@ -79,4 +132,24 @@ function toBytes(chunk: unknown): Uint8Array {
   if (chunk instanceof Uint8Array) return chunk;
   if (typeof chunk === "string") return new TextEncoder().encode(chunk);
   throw new TypeError("Node stream produced a non-byte chunk.");
+}
+
+async function* iterateWebStream(
+  source: ReadableStream<Uint8Array>,
+): AsyncGenerator<Uint8Array, void, undefined> {
+  const reader = source.getReader();
+  let completed = false;
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) {
+        completed = true;
+        return;
+      }
+      yield result.value;
+    }
+  } finally {
+    if (!completed) await reader.cancel();
+    reader.releaseLock();
+  }
 }
