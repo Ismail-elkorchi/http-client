@@ -11,10 +11,13 @@ import {
   createZstdDecompress,
 } from "node:zlib";
 import type { HttpClientError } from "./errors.js";
+import { emitHttpClientEvent } from "./observer.js";
 import type {
+  HttpAttemptContext,
+  HttpAttemptResponseHead,
+  HttpAttemptTransfer,
+  HttpClientObserver,
   HttpResponseCompletion,
-  ResponseHeadTimings,
-  ResponseTransfer,
   ResponseTransferLimits,
 } from "./types.js";
 
@@ -30,10 +33,13 @@ export interface StreamingBodyOptions {
   readonly limits: ResponseTransferLimits;
   readonly responseBodyProgressTimeoutMs: number;
   readonly signal: AbortSignal;
-  readonly requestStartedAt: number;
-  readonly headTimings: ResponseHeadTimings;
+  readonly attemptStartedAt: number;
+  readonly context: HttpAttemptContext;
+  readonly response: HttpAttemptResponseHead;
+  readonly observer: HttpClientObserver | undefined;
+  readonly onCompletion: (attempt: HttpResponseCompletion) => void;
   readonly requestBodyBytesSent: () => number;
-  readonly trailers: Readonly<Record<string, string>>;
+  readonly trailers: () => import("./fields.js").HttpFields;
   readonly classifyFailure: (
     caught: unknown,
     decoding: boolean,
@@ -64,14 +70,26 @@ export function createStreamingBody(
       );
     }, options.responseBodyProgressTimeoutMs);
   };
+  const reportProgress = (): void => {
+    emitHttpClientEvent(options.observer, {
+      kind: "response-body-progress",
+      context: options.context,
+      wireBytesReceived: wireCounter.bytesRead,
+      decodedBytesReceived: decodedCounter.bytesRead,
+    });
+  };
   const wireCounter = new ResponseByteLimitTransform(
     "wire",
     options.limits.maxWireBytes,
-    requireProgress,
+    () => {
+      requireProgress();
+      reportProgress();
+    },
   );
   const decodedCounter = new ResponseByteLimitTransform(
     "decoded",
     options.limits.maxDecodedBytes,
+    reportProgress,
   );
   const bodyStartedAt = performance.now();
   let cancellationRequested = false;
@@ -205,15 +223,19 @@ async function completePipeline(
 ): Promise<HttpResponseCompletion> {
   try {
     await operation;
-    return {
+    const attempt = {
       kind: "complete",
+      ...options.context,
+      response: options.response,
       transfer: transfer(
         options,
         wireCounter,
         decodedCounter,
         bodyStartedAt,
       ),
-    };
+    } as const;
+    options.onCompletion(attempt);
+    return attempt;
   } catch (caught) {
     const observedTransfer = transfer(
       options,
@@ -222,16 +244,27 @@ async function completePipeline(
       bodyStartedAt,
     );
     if (cancellationRequested()) {
-      return { kind: "cancelled", transfer: observedTransfer };
+      const attempt = {
+        kind: "cancelled",
+        ...options.context,
+        response: options.response,
+        transfer: observedTransfer,
+      } as const;
+      options.onCompletion(attempt);
+      return attempt;
     }
-    return {
+    const attempt = {
       kind: "failure",
+      ...options.context,
+      response: options.response,
       error: options.classifyFailure(
         cancellationReason() ?? caught,
         decoding,
       ),
       transfer: observedTransfer,
-    };
+    } as const;
+    options.onCompletion(attempt);
+    return attempt;
   }
 }
 
@@ -240,17 +273,17 @@ function transfer(
   wireCounter: ResponseByteLimitTransform,
   decodedCounter: ResponseByteLimitTransform,
   bodyStartedAt: number,
-): ResponseTransfer {
+): HttpAttemptTransfer {
   const completedAt = performance.now();
   return {
     requestBodyBytesSent: options.requestBodyBytesSent(),
     wireBytesReceived: wireCounter.bytesRead,
     decodedBytesReceived: decodedCounter.bytesRead,
-    trailers: headersFromRecord(options.trailers),
+    trailers: options.trailers(),
     timings: {
-      ...options.headTimings,
+      ...options.response.timings,
       responseBodyMs: completedAt - bodyStartedAt,
-      totalMs: completedAt - options.requestStartedAt,
+      totalMs: completedAt - options.attemptStartedAt,
     },
   };
 }
@@ -284,16 +317,6 @@ function createDecoder(encoding: string): Transform {
         `Unsupported content encoding: ${encoding}`,
       );
   }
-}
-
-function headersFromRecord(
-  source: Readonly<Record<string, string>>,
-): Headers {
-  const headers = new Headers();
-  for (const [name, value] of Object.entries(source)) {
-    headers.append(name, value);
-  }
-  return headers;
 }
 
 function ignoreFailure(): undefined {

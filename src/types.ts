@@ -1,8 +1,11 @@
 import type { SecureVersion } from "node:tls";
 import type { RESPONSE_BODY_BRAND } from "./body-brand.js";
 import type { HttpClientError } from "./errors.js";
+import type { HttpFields } from "./fields.js";
 
-export type HttpMethod =
+declare const EXTENSION_HTTP_METHOD: unique symbol;
+
+export type StandardHttpMethod =
   | "GET"
   | "HEAD"
   | "POST"
@@ -11,6 +14,24 @@ export type HttpMethod =
   | "DELETE"
   | "OPTIONS"
   | "TRACE";
+
+export type ExtensionHttpMethod = string & {
+  readonly [EXTENSION_HTTP_METHOD]: true;
+};
+
+export type HttpMethod = StandardHttpMethod | ExtensionHttpMethod;
+
+export interface HttpFieldInput {
+  readonly name: string;
+  readonly value: string;
+}
+
+export interface HttpField {
+  readonly name: string;
+  readonly value: string;
+}
+
+export type HttpFieldsInput = readonly HttpFieldInput[];
 
 export type ProtocolPreference = "auto" | "http1" | "http2";
 export type HttpVersion = "http/1.1" | "http/2";
@@ -71,15 +92,15 @@ export interface ResponseStorageOptions {
 }
 
 export interface HttpTimeouts {
-  readonly totalMs: number;
+  readonly totalMs: number | null;
   readonly connectMs: number;
-  readonly responseHeadersMs: number;
+  readonly responseFieldsMs: number;
   readonly responseBodyProgressMs: number;
 }
 
 export interface RequestTimeoutOverrides {
-  readonly totalMs?: number;
-  readonly responseHeadersMs?: number;
+  readonly totalMs?: number | null;
+  readonly responseFieldsMs?: number;
   readonly responseBodyProgressMs?: number;
 }
 
@@ -102,14 +123,18 @@ export interface TlsOptions {
 
 export interface ProxyOptions {
   readonly url: string;
-  readonly headers: Readonly<Record<string, string>>;
+  readonly fields: HttpFields;
   readonly tls: TlsOptions;
 }
 
 export interface ProxyConfiguration {
   readonly url: string | URL;
-  readonly headers?: Readonly<Record<string, string>>;
+  readonly fields?: HttpFieldsInput;
   readonly tls?: Partial<TlsOptions>;
+}
+
+export interface HttpClientObserver {
+  onEvent(event: HttpClientEvent): void;
 }
 
 export interface HttpClientOptions {
@@ -120,14 +145,15 @@ export interface HttpClientOptions {
   readonly maxConnectionsPerOrigin: number;
   readonly maxOrigins: number;
   readonly maxRequestBodyBytes: number;
-  readonly maxRequestHeadersBytes: number;
-  readonly maxResponseHeadersBytes: number;
-  readonly defaultHeaders: Readonly<Record<string, string>>;
+  readonly maxRequestFieldsBytes: number;
+  readonly maxResponseFieldsBytes: number;
+  readonly defaultFields: HttpFields;
   readonly responseTransferLimits: ResponseTransferLimits;
   readonly responseStorage: ResponseStorageOptions;
   readonly tls: TlsOptions;
   readonly proxy: ProxyOptions | null;
   readonly networkSafety: NetworkSafetyOptions;
+  readonly observer?: HttpClientObserver;
   readonly resolver?: NetworkResolver;
 }
 
@@ -139,14 +165,15 @@ export interface HttpClientConfiguration {
   readonly maxConnectionsPerOrigin?: number;
   readonly maxOrigins?: number;
   readonly maxRequestBodyBytes?: number;
-  readonly maxRequestHeadersBytes?: number;
-  readonly maxResponseHeadersBytes?: number;
-  readonly defaultHeaders?: Readonly<Record<string, string>>;
+  readonly maxRequestFieldsBytes?: number;
+  readonly maxResponseFieldsBytes?: number;
+  readonly defaultFields?: HttpFieldsInput;
   readonly responseTransferLimits?: Partial<ResponseTransferLimits>;
   readonly responseStorage?: Partial<ResponseStorageOptions>;
   readonly tls?: Partial<TlsOptions>;
   readonly proxy?: ProxyConfiguration | null;
   readonly networkSafety?: Partial<NetworkSafetyOptions>;
+  readonly observer?: HttpClientObserver;
   readonly resolver?: NetworkResolver;
 }
 
@@ -186,9 +213,28 @@ export type HttpRequestBody =
       readonly contentLength?: number;
     };
 
-export interface CredentialProvider {
-  requestHeaders(url: string): Promise<Readonly<Record<string, string>>>;
-  captureResponse(url: string, headers: Headers): Promise<void>;
+export interface HttpAttemptContext {
+  readonly requestId: number;
+  readonly attemptIndex: number;
+  readonly url: string;
+  readonly method: HttpMethod;
+}
+
+export interface HttpSessionRequestContext extends HttpAttemptContext {
+  readonly fields: HttpFields;
+}
+
+export interface HttpSessionResponseContext extends HttpAttemptContext {
+  readonly statusCode: number;
+  readonly statusMessage: string | null;
+  readonly fields: HttpFields;
+}
+
+export interface HttpSessionAdapter {
+  prepareRequest(
+    context: HttpSessionRequestContext,
+  ): Promise<HttpFieldsInput | undefined>;
+  acceptResponse(context: HttpSessionResponseContext): Promise<void>;
 }
 
 export type RedirectDecision =
@@ -203,14 +249,15 @@ export interface RedirectContext {
 }
 
 interface HttpRequestOptionsBase {
-  readonly headers?: Readonly<Record<string, string>>;
+  readonly fields?: HttpFieldsInput;
   readonly signal?: AbortSignal;
   readonly timeouts?: RequestTimeoutOverrides;
   readonly responseContentDecoding?: ResponseContentDecoding;
   readonly responseTransferLimits?: Partial<ResponseTransferLimits>;
   readonly maxRequestBodyBytes?: number;
   readonly maxRedirects?: number;
-  readonly credentials?: CredentialProvider;
+  readonly session?: HttpSessionAdapter;
+  readonly observer?: HttpClientObserver;
   readonly onInformationalResponse?: (
     response: InformationalResponse,
   ) => void;
@@ -230,7 +277,9 @@ type BodylessRequestOptions =
     };
 
 type BodyRequestOptions = {
-  readonly method: Exclude<HttpMethod, "GET" | "HEAD" | "TRACE">;
+  readonly method:
+    | Exclude<StandardHttpMethod, "GET" | "HEAD" | "TRACE">
+    | ExtensionHttpMethod;
   readonly body?: HttpRequestBody;
 };
 
@@ -239,7 +288,7 @@ export type HttpRequestOptions = HttpRequestOptionsBase &
 
 export interface InformationalResponse {
   readonly statusCode: number;
-  readonly headers: Headers;
+  readonly fields: HttpFields;
 }
 
 export type BufferedHttpRequestOptions = HttpRequestOptions & {
@@ -272,7 +321,7 @@ export type ResponseBody = MemoryResponseBody | FileResponseBody;
 
 export interface ResponseHeadTimings {
   readonly dnsMs: number | null;
-  readonly responseHeadersMs: number;
+  readonly responseFieldsMs: number;
 }
 
 export interface ResponseTransferTimings extends ResponseHeadTimings {
@@ -318,7 +367,7 @@ export type HttpErrorCode =
   | "TLS_ERROR"
   | "TOTAL_TIMEOUT"
   | "CONNECT_TIMEOUT"
-  | "RESPONSE_HEADERS_TIMEOUT"
+  | "RESPONSE_FIELDS_TIMEOUT"
   | "RESPONSE_BODY_TIMEOUT"
   | "REQUEST_ABORTED"
   | "NETWORK_FAILURE"
@@ -327,8 +376,8 @@ export type HttpErrorCode =
   | "REQUEST_BODY_TOO_LARGE"
   | "REQUEST_BODY_LENGTH_MISMATCH"
   | "REQUEST_BODY_SOURCE_FAILURE"
-  | "REQUEST_HEADERS_TOO_LARGE"
-  | "RESPONSE_HEADERS_TOO_LARGE"
+  | "REQUEST_FIELDS_TOO_LARGE"
+  | "RESPONSE_FIELDS_TOO_LARGE"
   | "TOO_MANY_REDIRECTS"
   | "REDIRECT_LOOP"
   | "REDIRECT_TARGET_REJECTED"
@@ -338,36 +387,76 @@ export type HttpErrorCode =
   | "ORIGIN_CAPACITY_EXCEEDED"
   | "FILESYSTEM_FAILURE";
 
-export interface ResponseTransfer {
+export interface HttpAttemptTransfer {
   readonly requestBodyBytesSent: number;
   readonly wireBytesReceived: number;
   readonly decodedBytesReceived: number;
-  readonly trailers: Headers;
+  readonly trailers: HttpFields;
   readonly timings: ResponseTransferTimings;
 }
 
-export type HttpResponseCompletion =
-  | {
-      readonly kind: "complete";
-      readonly transfer: ResponseTransfer;
-    }
-  | {
-      readonly kind: "cancelled";
-      readonly transfer: ResponseTransfer;
-    }
-  | {
-      readonly kind: "failure";
-      readonly error: HttpClientError;
-      readonly transfer: ResponseTransfer;
-    };
+export interface HttpAttemptResponseHead {
+  readonly statusCode: number;
+  readonly statusMessage: string | null;
+  readonly fields: HttpFields;
+  readonly connection: ConnectionFacts;
+  readonly timings: ResponseHeadTimings;
+}
 
-interface HttpResponseBase {
+type HttpAttemptResultBase = HttpAttemptContext;
+
+export interface HttpCompletedAttempt extends HttpAttemptResultBase {
+  readonly kind: "complete";
+  readonly response: HttpAttemptResponseHead;
+  readonly transfer: HttpAttemptTransfer;
+}
+
+export interface HttpCancelledAttempt extends HttpAttemptResultBase {
+  readonly kind: "cancelled";
+  readonly response: HttpAttemptResponseHead;
+  readonly transfer: HttpAttemptTransfer;
+}
+
+export interface HttpRedirectAttempt extends HttpAttemptResultBase {
+  readonly kind: "redirect";
+  readonly response: HttpAttemptResponseHead;
+  readonly transfer: HttpAttemptTransfer;
+  readonly redirect: HttpRedirect;
+}
+
+export interface HttpFailedAttempt extends HttpAttemptResultBase {
+  readonly kind: "failure";
+  readonly response: HttpAttemptResponseHead | null;
+  readonly transfer: HttpAttemptTransfer | null;
+  readonly error: HttpClientError;
+}
+
+export interface HttpResponseFailedAttempt extends HttpAttemptResultBase {
+  readonly kind: "failure";
+  readonly response: HttpAttemptResponseHead;
+  readonly transfer: HttpAttemptTransfer;
+  readonly error: HttpClientError;
+}
+
+export type HttpAttemptResult =
+  | HttpCompletedAttempt
+  | HttpCancelledAttempt
+  | HttpRedirectAttempt
+  | HttpFailedAttempt;
+
+export type HttpResponseCompletion =
+  | HttpCompletedAttempt
+  | HttpCancelledAttempt
+  | HttpResponseFailedAttempt;
+
+interface HttpResponseBase extends HttpAttemptContext {
   readonly kind: "response";
   readonly statusCode: number;
   readonly statusMessage: string | null;
   readonly finalUrl: string;
-  readonly headers: Headers;
+  readonly fields: HttpFields;
   readonly redirects: readonly HttpRedirect[];
+  readonly previousAttempts: readonly HttpAttemptResult[];
   readonly connection: ConnectionFacts;
   readonly headTimings: ResponseHeadTimings;
 }
@@ -380,20 +469,48 @@ export interface StreamingHttpResponse extends HttpResponseBase {
 
 export interface BufferedHttpResponse extends HttpResponseBase {
   readonly body: ResponseBody;
-  readonly transfer: ResponseTransfer;
+  readonly attempts: readonly HttpAttemptResult[];
 }
 
 export interface HttpFailure {
   readonly kind: "failure";
+  readonly requestId: number;
   readonly error: HttpClientError;
   readonly finalUrl: string;
   readonly statusCode: number | null;
   readonly statusMessage: string | null;
-  readonly headers: Headers;
+  readonly fields: HttpFields;
   readonly redirects: readonly HttpRedirect[];
+  readonly attempts: readonly HttpAttemptResult[];
   readonly connection: ConnectionFacts | null;
-  readonly transfer: ResponseTransfer | null;
 }
 
 export type StreamingHttpResult = StreamingHttpResponse | HttpFailure;
 export type BufferedHttpResult = BufferedHttpResponse | HttpFailure;
+
+export type HttpClientEvent =
+  | {
+      readonly kind: "attempt-started";
+      readonly context: HttpAttemptContext;
+      readonly fields: HttpFields;
+    }
+  | {
+      readonly kind: "request-body-progress";
+      readonly context: HttpAttemptContext;
+      readonly sentBytes: number;
+    }
+  | {
+      readonly kind: "response-started";
+      readonly context: HttpAttemptContext;
+      readonly response: HttpAttemptResponseHead;
+    }
+  | {
+      readonly kind: "response-body-progress";
+      readonly context: HttpAttemptContext;
+      readonly wireBytesReceived: number;
+      readonly decodedBytesReceived: number;
+    }
+  | {
+      readonly kind: "attempt-completed";
+      readonly attempt: HttpAttemptResult;
+    };

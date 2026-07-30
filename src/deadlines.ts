@@ -6,30 +6,33 @@ export class TotalTimeoutError extends Error {
   }
 }
 
-export class ResponseHeadersTimeoutError extends Error {
-  public override readonly name = "ResponseHeadersTimeoutError";
+export class ResponseFieldsTimeoutError extends Error {
+  public override readonly name = "ResponseFieldsTimeoutError";
 
   public constructor(timeoutMs: number) {
-    super(`Response headers did not arrive within ${String(timeoutMs)}ms.`);
+    super(`The response field section did not arrive within ${String(timeoutMs)}ms.`);
   }
 }
 
 export class RequestDeadline {
   public readonly signal: AbortSignal;
   private readonly controller = new AbortController();
-  private readonly timer: ReturnType<typeof setTimeout>;
+  private readonly timer: ReturnType<typeof setTimeout> | null;
   private readonly externalSignal: AbortSignal | undefined;
   private disposed = false;
 
   public constructor(
-    timeoutMs: number,
+    timeoutMs: number | null,
     externalSignal: AbortSignal | undefined,
   ) {
     this.signal = this.controller.signal;
     this.externalSignal = externalSignal;
-    this.timer = setTimeout(() => {
-      this.controller.abort(new TotalTimeoutError(timeoutMs));
-    }, timeoutMs);
+    this.timer =
+      timeoutMs === null
+        ? null
+        : setTimeout(() => {
+            this.controller.abort(new TotalTimeoutError(timeoutMs));
+          }, timeoutMs);
     if (externalSignal?.aborted === true) {
       this.controller.abort(externalSignal.reason);
     } else {
@@ -42,7 +45,7 @@ export class RequestDeadline {
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    clearTimeout(this.timer);
+    if (this.timer !== null) clearTimeout(this.timer);
     this.externalSignal?.removeEventListener(
       "abort",
       this.abortFromExternal,

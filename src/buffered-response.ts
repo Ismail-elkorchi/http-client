@@ -72,12 +72,17 @@ export async function bufferResult(
     statusCode: result.statusCode,
     statusMessage: result.statusMessage,
     finalUrl: result.finalUrl,
-    headers: result.headers,
+    requestId: result.requestId,
+    attemptIndex: result.attemptIndex,
+    method: result.method,
+    url: result.url,
+    fields: result.fields,
     redirects: result.redirects,
+    previousAttempts: result.previousAttempts,
     connection: result.connection,
     headTimings: result.headTimings,
     body,
-    transfer: completion.transfer,
+    attempts: [...result.previousAttempts, completion],
   };
   return buffered;
 }

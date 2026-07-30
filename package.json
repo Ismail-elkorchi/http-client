@@ -3,9 +3,7 @@
   "version": "0.1.0",
   "description": "Strict streaming HTTP client for Node.js.",
   "type": "module",
-  "sideEffects": [
-    "./dist/connection-observer.js"
-  ],
+  "sideEffects": false,
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -338,6 +338,9 @@ async function* iterateLimitedBytes(
   const account = (chunk: Uint8Array): Uint8Array => {
     bytesRead += chunk.byteLength;
     if (bytesRead > limit) throw new RequestBodyLimitError(limit);
+    if (expectedLength !== null && bytesRead > expectedLength) {
+      throw new RequestBodyLengthError(expectedLength, bytesRead);
+    }
     return chunk;
   };
   if (isWebReadableStream(source)) {
@@ -348,7 +351,7 @@ async function* iterateLimitedBytes(
         const result = await reader.read();
         if (result.done) {
           completed = true;
-          return;
+          break;
         }
         if (!(result.value instanceof Uint8Array)) {
           throw new RequestBodySourceError(

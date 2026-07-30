@@ -1,15 +1,28 @@
-import type { LookupFunction } from "node:net";
+import {
+  connect as connectTcp,
+  isIP,
+  type LookupFunction,
+  type Socket,
+} from "node:net";
+import tls from "node:tls";
+import type { TLSSocket } from "node:tls";
 import {
   buildConnector,
+  errors as undiciErrors,
   Pool,
   ProxyAgent,
   request,
   type Dispatcher,
 } from "undici";
 import {
-  observeRequest,
-  recordConnectionDuration,
+  UndiciConnectionObserver,
 } from "./connection-observer.js";
+import {
+  httpFieldsFromRaw,
+  httpFieldsToFlatArray,
+  httpFieldsToRecord,
+} from "./fields.js";
+import type { HttpFields } from "./fields.js";
 import type { NetworkSafetyPolicy } from "./network-policy.js";
 import type { TransportRequestBody } from "./request-body.js";
 import type {
@@ -23,22 +36,23 @@ import type {
 
 export interface TransportRequestOptions {
   readonly method: HttpMethod;
-  readonly headers: Readonly<Record<string, string>>;
+  readonly fields: HttpFields;
   readonly createBody: () => TransportRequestBody | undefined;
   readonly signal: AbortSignal;
-  readonly responseHeadersTimeoutMs: number;
+  readonly responseFieldsTimeoutMs: number;
   readonly responseBodyInactivityTimeoutMs: number;
   readonly onInformationalResponse:
-    | ((statusCode: number, headers: Headers) => void)
+    | ((statusCode: number, fields: HttpFields) => void)
     | undefined;
+  readonly onRequestBodyProgress: (sentBytes: number) => void;
 }
 
 export interface TransportResponse {
   readonly statusCode: number;
   readonly statusMessage: string | null;
-  readonly headers: Headers;
+  readonly fields: HttpFields;
   readonly body: Dispatcher.ResponseData["body"];
-  readonly trailers: Readonly<Record<string, string>>;
+  readonly trailers: () => HttpFields;
   readonly connection: ConnectionFacts;
   readonly dnsMs: number | null;
   readonly requestBodyBytesSent: () => number;
@@ -54,6 +68,7 @@ export class UndiciTransport {
   private readonly policy: NetworkSafetyPolicy;
   private readonly options: HttpClientOptions;
   private readonly origins = new Map<string, OriginDispatcher>();
+  private readonly observer = new UndiciConnectionObserver();
   private acquisitions: Promise<void> = Promise.resolve();
   private useCounter = 0;
   private closed = false;
@@ -72,6 +87,14 @@ export class UndiciTransport {
   ): Promise<TransportResponse> {
     if (this.closed) {
       throw new TransportClosedError();
+    }
+    if (
+      this.options.protocolPreference === "http2" &&
+      url.protocol !== "https:"
+    ) {
+      throw new ProtocolMismatchError(
+        "Strict HTTP/2 requires a TLS origin.",
+      );
     }
     const dnsStartedAt =
       this.options.proxy === null ? performance.now() : null;
@@ -97,7 +120,7 @@ export class UndiciTransport {
 
     try {
       const body = options.createBody();
-      const observed = await observeRequest(
+      const observed = await this.observer.observeRequest(
         {
           origin: url.origin,
           path: `${url.pathname}${url.search}`,
@@ -107,9 +130,10 @@ export class UndiciTransport {
           await request(url, {
             dispatcher: state.dispatcher,
             method: options.method,
-            headers: options.headers,
+            headers: httpFieldsToFlatArray(options.fields),
+            responseHeaders: "raw",
             ...(body === undefined ? {} : { body }),
-            headersTimeout: options.responseHeadersTimeoutMs,
+            headersTimeout: options.responseFieldsTimeoutMs,
             bodyTimeout: options.responseBodyInactivityTimeoutMs,
             ...(options.onInformationalResponse === undefined
               ? {}
@@ -117,12 +141,13 @@ export class UndiciTransport {
                   onInfo: ({ statusCode, headers }) => {
                     options.onInformationalResponse?.(
                       statusCode,
-                      headersFromIncoming(headers),
+                      rawResponseFields(headers),
                     );
                   },
                 }),
             signal: options.signal,
           }),
+        options.onRequestBodyProgress,
       );
       releaseWhenFinished(observed.value.body, release);
       const proxyUrl =
@@ -133,20 +158,12 @@ export class UndiciTransport {
         ...observed.facts,
         proxyUrl,
       };
-      if (
-        this.options.protocolPreference === "http2" &&
-        connection.httpVersion !== "http/2"
-      ) {
-        observed.value.body.on("error", ignoreFailure);
-        observed.value.body.destroy();
-        throw new ProtocolMismatchError();
-      }
       return {
         statusCode: observed.value.statusCode,
-        statusMessage: observed.statusMessage,
-        headers: headersFromIncoming(observed.value.headers),
+        statusMessage: normalizedStatusMessage(observed.value.statusText),
+        fields: rawResponseFields(observed.value.headers),
         body: observed.value.body,
-        trailers: observed.value.trailers,
+        trailers: () => httpFieldsFromRaw(observed.rawTrailers()),
         connection,
         dnsMs,
         requestBodyBytesSent: observed.requestBodyBytesSent,
@@ -166,11 +183,15 @@ export class UndiciTransport {
       ({ dispatcher }) => dispatcher,
     );
     this.origins.clear();
-    await Promise.all(
-      dispatchers.map(async (dispatcher) => {
-        await dispatcher.close();
-      }),
-    );
+    try {
+      await Promise.all(
+        dispatchers.map(async (dispatcher) => {
+          await dispatcher.close();
+        }),
+      );
+    } finally {
+      this.observer.close();
+    }
   }
 
   public async destroy(reason?: Error): Promise<void> {
@@ -182,11 +203,15 @@ export class UndiciTransport {
       ({ dispatcher }) => dispatcher,
     );
     this.origins.clear();
-    await Promise.all(
-      dispatchers.map(async (dispatcher) => {
-        await dispatcher.destroy(reason ?? null);
-      }),
-    );
+    try {
+      await Promise.all(
+        dispatchers.map(async (dispatcher) => {
+          await dispatcher.destroy(reason ?? null);
+        }),
+      );
+    } finally {
+      this.observer.close();
+    }
   }
 
   private async acquire(origin: string): Promise<OriginDispatcher> {
@@ -229,10 +254,10 @@ export class UndiciTransport {
     if (this.options.proxy !== null) {
       return new ProxyAgent({
         uri: this.options.proxy.url,
-        headers: this.options.proxy.headers,
+        headers: httpFieldsToRecord(this.options.proxy.fields),
         allowH2: this.options.protocolPreference !== "http1",
         connections: this.options.maxConnectionsPerOrigin,
-        maxHeaderSize: this.options.maxResponseHeadersBytes,
+        maxHeaderSize: this.options.maxResponseFieldsBytes,
         requestTls: connectorOptions(
           this.options.tls,
           this.options,
@@ -246,21 +271,34 @@ export class UndiciTransport {
       });
     }
     const allowH2 = this.options.protocolPreference !== "http1";
+    const lookup = this.pinnedLookup();
+    const baseConnector =
+      this.options.protocolPreference === "http2"
+        ? timedConnector(
+            strictHttp2Connector(
+              this.options.tls,
+              this.options,
+              lookup,
+            ),
+            this.observer,
+          )
+        : timedConnector(
+            buildConnector(
+              connectorOptions(
+                this.options.tls,
+                this.options,
+                lookup,
+              ),
+            ),
+            this.observer,
+          );
     return new Pool(origin, {
       allowH2,
       connections: this.options.maxConnectionsPerOrigin,
-      maxHeaderSize: this.options.maxResponseHeadersBytes,
+      maxHeaderSize: this.options.maxResponseFieldsBytes,
       connectTimeout: this.options.timeouts.connectMs,
       strictContentLength: true,
-      connect: timedConnector(
-        buildConnector(
-          connectorOptions(
-            this.options.tls,
-            this.options,
-            this.pinnedLookup(),
-          ),
-        ),
-      ),
+      connect: baseConnector,
     });
   }
 
@@ -322,8 +360,8 @@ export class NetworkSafetyError extends Error {
 export class ProtocolMismatchError extends Error {
   public override readonly name = "ProtocolMismatchError";
 
-  public constructor() {
-    super("The server did not negotiate HTTP/2.");
+  public constructor(message = "The server did not negotiate HTTP/2.") {
+    super(message);
   }
 }
 
@@ -400,20 +438,6 @@ function tlsMaterial(
   );
 }
 
-function headersFromIncoming(
-  source: Dispatcher.ResponseData["headers"],
-): Headers {
-  const headers = new Headers();
-  for (const [name, value] of Object.entries(source)) {
-    if (Array.isArray(value)) {
-      for (const item of value) headers.append(name, item);
-    } else if (value !== undefined) {
-      headers.append(name, value);
-    }
-  }
-  return headers;
-}
-
 function releaseWhenFinished(
   body: Dispatcher.ResponseData["body"],
   release: () => void,
@@ -428,10 +452,6 @@ function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error("DNS lookup failed.");
 }
 
-function ignoreFailure(): undefined {
-  return undefined;
-}
-
 function ignoreResult(): void {}
 
 function redactedProxyUrl(value: string): string {
@@ -443,12 +463,13 @@ function redactedProxyUrl(value: string): string {
 
 function timedConnector(
   connector: buildConnector.connector,
+  observer: UndiciConnectionObserver,
 ): buildConnector.connector {
   return (options, callback): void => {
     const startedAt = performance.now();
     connector(options, (error, socket) => {
       if (socket !== null && socket !== undefined) {
-        recordConnectionDuration(socket, performance.now() - startedAt);
+        observer.recordConnectionDuration(socket, performance.now() - startedAt);
       }
       if (error !== null) {
         callback(error, null);
@@ -457,4 +478,184 @@ function timedConnector(
       }
     });
   };
+}
+
+function strictHttp2Connector(
+  configuredTls: TlsOptions,
+  client: HttpClientOptions,
+  lookup: LookupFunction,
+): buildConnector.connector {
+  const sessions = new Map<string, Buffer>();
+  return (options, callback): void => {
+    const serverName =
+      options.servername ??
+      configuredTls.serverName ??
+      (isIpLiteral(options.hostname) ? undefined : options.hostname);
+    const sessionKey = serverName ?? options.hostname;
+    let settled = false;
+    const finish = (
+      error: Error | null,
+      socket: TLSSocket | null,
+    ): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error === null && socket !== null) {
+        callback(null, socket);
+      } else {
+        callback(error ?? new Error("TLS connection failed."), null);
+      }
+    };
+    const tlsConnectionOptions = {
+      rejectUnauthorized: configuredTls.rejectUnauthorized,
+      ...(configuredTls.certificateAuthorities === undefined
+        ? {}
+        : { ca: tlsMaterial(configuredTls.certificateAuthorities) }),
+      ...(configuredTls.clientCertificate === undefined
+        ? {}
+        : { cert: tlsMaterial(configuredTls.clientCertificate) }),
+      ...(configuredTls.clientPrivateKey === undefined
+        ? {}
+        : { key: tlsMaterial(configuredTls.clientPrivateKey) }),
+      ...(configuredTls.privateKeyPassphrase === undefined
+        ? {}
+        : { passphrase: configuredTls.privateKeyPassphrase }),
+      ...(configuredTls.minimumVersion === undefined
+        ? {}
+        : { minVersion: configuredTls.minimumVersion }),
+      ...(configuredTls.maximumVersion === undefined
+        ? {}
+        : { maxVersion: configuredTls.maximumVersion }),
+      ...(configuredTls.ciphers === undefined
+        ? {}
+        : { ciphers: configuredTls.ciphers }),
+      ...(serverName === undefined ? {} : { servername: serverName }),
+      ...(sessions.get(sessionKey) === undefined
+        ? {}
+        : { session: sessions.get(sessionKey) }),
+      ALPNProtocols: ["h2"],
+    };
+    let activeSocket: Socket | TLSSocket;
+    let socket: Socket;
+    try {
+      socket = connectTcp({
+        host: options.hostname,
+        port: Number(options.port || 443),
+        localAddress: options.localAddress ?? undefined,
+        lookup,
+        autoSelectFamily: true,
+        autoSelectFamilyAttemptTimeout:
+          client.networkSafety.addressAttemptDelayMs,
+      });
+      activeSocket = socket;
+    } catch (caught) {
+      callback(toError(caught), null);
+      return;
+    }
+    const timeoutError = new undiciErrors.ConnectTimeoutError();
+    const timer = setTimeout(() => {
+      activeSocket.destroy(timeoutError);
+    }, client.timeouts.connectMs);
+    const tcpFailure = (error: Error): void => {
+      finish(normalizedTcpConnectionError(error), null);
+    };
+    socket.setKeepAlive(true, 60_000);
+    socket.setNoDelay(true);
+    socket.once("error", tcpFailure);
+    socket.once("connect", () => {
+      socket.off("error", tcpFailure);
+      let secureSocket: TLSSocket;
+      try {
+        secureSocket = tls.connect({
+          socket,
+          ...tlsConnectionOptions,
+        });
+        activeSocket = secureSocket;
+      } catch (caught) {
+        const error = toError(caught);
+        socket.destroy(error);
+        finish(error, null);
+        return;
+      }
+      secureSocket.on("session", (session) => {
+        sessions.delete(sessionKey);
+        sessions.set(sessionKey, session);
+        if (sessions.size > 100) {
+          const oldest = sessions.keys().next().value;
+          if (oldest !== undefined) sessions.delete(oldest);
+        }
+      });
+      secureSocket.once("secureConnect", () => {
+        if (secureSocket.alpnProtocol !== "h2") {
+          const error = new ProtocolMismatchError();
+          secureSocket.destroy(error);
+          finish(error, null);
+          return;
+        }
+        finish(null, secureSocket);
+      });
+      secureSocket.on("error", (error: unknown) => {
+        finish(
+          isAlpnNegotiationFailure(error)
+            ? new ProtocolMismatchError()
+            : toError(error),
+          null,
+        );
+      });
+    });
+  };
+}
+
+function rawResponseFields(value: unknown): HttpFields {
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      (item) => typeof item === "string" || item instanceof Uint8Array,
+    )
+  ) {
+    throw new Error("The HTTP transport did not return raw field lines.");
+  }
+  return httpFieldsFromRaw(value);
+}
+
+function normalizedStatusMessage(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function isIpLiteral(value: string): boolean {
+  return isIP(value) !== 0;
+}
+
+function isAlpnNegotiationFailure(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "code" in value &&
+    value.code === "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL"
+  );
+}
+
+function normalizedTcpConnectionError(error: Error): Error {
+  if (
+    error instanceof AggregateError &&
+    error.errors.some(
+      (item: unknown) => errorCode(item) === "ETIMEDOUT",
+    )
+  ) {
+    const timeout = new undiciErrors.ConnectTimeoutError();
+    timeout.cause = error;
+    return timeout;
+  }
+  return error;
+}
+
+function errorCode(value: unknown): string | null {
+  return (
+      typeof value === "object" &&
+      value !== null &&
+      "code" in value &&
+      typeof value.code === "string"
+    )
+    ? value.code
+    : null;
 }

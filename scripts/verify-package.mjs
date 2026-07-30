@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
@@ -60,7 +59,6 @@ try {
   if (typeof fileName !== "string") {
     throw new Error("npm pack did not report a package archive.");
   }
-  const archive = path.join(directory, fileName);
   const consumerDirectory = path.join(directory, "consumer");
   await fs.mkdir(consumerDirectory);
   await fs.writeFile(
@@ -69,7 +67,7 @@ try {
       private: true,
       type: "module",
       dependencies: {
-        "@ismail-elkorchi/http-client": pathToFileURL(archive).href,
+        "@ismail-elkorchi/http-client": `file:../${fileName}`,
       },
     }),
   );

@@ -19,7 +19,7 @@ import {
   urlFor,
 } from "./support.mjs";
 
-test("returns response headers before the network body reaches EOF", async () => {
+test("returns response fields before the network body reaches EOF", async () => {
   let responseClosed = false;
   const server = await listen(
     http.createServer((_request, response) => {
@@ -124,13 +124,15 @@ test("buffers through the same decoded stream and captures trailers", async () =
     const result = await client.requestBuffered(urlFor(server));
     assert.equal(result.kind, "response");
     assert.deepEqual(Buffer.from(await readResponseBody(result.body)), payload);
-    assert.equal(result.transfer.wireBytesReceived, encoded.byteLength);
-    assert.equal(result.transfer.decodedBytesReceived, payload.byteLength);
-    assert.equal(result.transfer.trailers.get("x-checksum"), "verified");
-    assert.equal(result.transfer.timings.responseBodyMs >= 0, true);
+    const finalAttempt = result.attempts.at(-1);
+    assert.equal(finalAttempt?.kind, "complete");
+    assert.equal(finalAttempt?.transfer.wireBytesReceived, encoded.byteLength);
+    assert.equal(finalAttempt?.transfer.decodedBytesReceived, payload.byteLength);
+    assert.equal(finalAttempt?.transfer.trailers.first("x-checksum"), "verified");
+    assert.equal(finalAttempt?.transfer.timings.responseBodyMs >= 0, true);
     assert.equal(
-      result.transfer.timings.totalMs >=
-        result.headTimings.responseHeadersMs,
+      (finalAttempt?.transfer.timings.totalMs ?? -1) >=
+        result.headTimings.responseFieldsMs,
       true,
     );
     await disposeResponseBody(result.body);
@@ -364,7 +366,7 @@ test("enforces wire and decoded limits while streaming", async () => {
   }
 });
 
-test("distinguishes response-header and body-inactivity deadlines", async () => {
+test("distinguishes response-field and body-inactivity deadlines", async () => {
   const server = await listen(
     http.createServer((request, response) => {
       if (request.url === "/headers") {
@@ -381,14 +383,14 @@ test("distinguishes response-header and body-inactivity deadlines", async () => 
     networkSafety: { allowLocalhost: true },
     timeouts: {
       totalMs: 1_000,
-      responseHeadersMs: 20,
+      responseFieldsMs: 20,
       responseBodyProgressMs: 50,
     },
   });
   try {
     const headers = await client.request(urlFor(server, "/headers"));
     assert.equal(headers.kind, "failure");
-    assert.equal(headers.error.code, "RESPONSE_HEADERS_TIMEOUT");
+    assert.equal(headers.error.code, "RESPONSE_FIELDS_TIMEOUT");
 
     const body = await client.request(urlFor(server, "/body"));
     assert.equal(body.kind, "response");

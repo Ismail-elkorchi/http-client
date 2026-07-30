@@ -3,8 +3,9 @@
 A streaming HTTP/1.1 and HTTP/2 client for Node.js 24 or newer.
 
 It provides bounded uploads and responses, redirects, content decoding,
-address-pinned DNS resolution, explicit proxy and TLS configuration, temporary
-file storage, cancellation, trailers, and connection facts.
+lossless HTTP field lines, address-pinned DNS resolution, explicit proxy and
+TLS configuration, temporary file storage, cancellation, trailers, connection
+facts, and attempt-level transfer results.
 
 ## Install
 
@@ -40,7 +41,7 @@ try {
 ```
 
 `request()` performs one exchange. `fetch()` follows redirects. Both return
-after the response headers arrive and keep the total deadline active until the
+after the response field section arrives and keep the total deadline active until the
 body completes or is cancelled.
 
 Every response body must be consumed or cancelled. `destroy()` cancels all
@@ -67,6 +68,7 @@ try {
     try {
       const bytes = await readResponseBody(result.body);
       console.log(bytes.byteLength);
+      console.log(result.attempts.at(-1)?.transfer?.wireBytesReceived);
     } finally {
       await disposeResponseBody(result.body);
     }
@@ -102,6 +104,48 @@ await client.fetch("https://example.com/upload", {
 
 The other body kinds are `text`, `bytes`, and `multipart`.
 
+Extension methods must be defined explicitly:
+
+```ts
+import { defineHttpMethod } from "@ismail-elkorchi/http-client";
+
+await client.request("https://example.com/resource", {
+  method: defineHttpMethod("PROPFIND"),
+});
+```
+
+## HTTP fields
+
+Requests accept ordered field lines and responses return an immutable
+`HttpFields` value. Repeated lines, including `set-cookie`, remain separate.
+
+```ts
+const result = await client.request("https://example.com/", {
+  fields: [
+    { name: "x-trace", value: "first" },
+    { name: "x-trace", value: "second" },
+  ],
+});
+
+if (result.kind === "response") {
+  console.log(result.fields.all("set-cookie"));
+}
+```
+
+`first()`, `all()`, `has()`, and iteration are lossless operations.
+`toHeaders()` is available when a caller explicitly accepts the Web
+`Headers` model.
+
+## Timeouts and observation
+
+Set `timeouts.totalMs` to `null` to disable only the total deadline. Connect,
+response-field, and response-body progress deadlines remain active.
+
+An observer receives discriminated attempt, request-body, response, and
+response-body progress events. Observer failures never alter the request.
+Session adapters can prepare fields and accept response state with the request
+identifier, attempt index, method, URL, and complete field lines.
+
 ## Network boundaries
 
 Public addresses are permitted by default. Local, private, reserved,
@@ -123,6 +167,11 @@ const proxyClient = new NodeHttpClient({
   proxy: { url: "http://proxy.example:8080/" },
 });
 ```
+
+`protocolPreference: "http2"` is strict: only TLS origins are accepted, and a
+connection is rejected before request bytes are written unless ALPN selects
+HTTP/2. Strict HTTP/2 is not accepted with a proxy because that negotiation
+cannot be verified before the tunneled request.
 
 Retry policy, cookies, caches, rate limits, and application sessions belong in
 consumer adapters.

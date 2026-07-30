@@ -6,6 +6,7 @@ import type {
   ResponseTransferLimits,
   TlsOptions,
 } from "./types.js";
+import { HttpFields } from "./fields.js";
 
 export const DEFAULT_NETWORK_SAFETY: NetworkSafetyOptions = Object.freeze({
   enabled: true,
@@ -33,7 +34,7 @@ export const DEFAULT_RESPONSE_STORAGE: ResponseStorageOptions = Object.freeze({
 export const DEFAULT_HTTP_TIMEOUTS: HttpTimeouts = Object.freeze({
   totalMs: 30_000,
   connectMs: 10_000,
-  responseHeadersMs: 15_000,
+  responseFieldsMs: 15_000,
   responseBodyProgressMs: 30_000,
 });
 
@@ -43,7 +44,7 @@ export const DEFAULT_TLS_OPTIONS: TlsOptions = Object.freeze({
 
 export const DEFAULT_HTTP_CLIENT_OPTIONS: Omit<
   HttpClientOptions,
-  "resolver"
+  "observer" | "resolver"
 > = Object.freeze({
   timeouts: DEFAULT_HTTP_TIMEOUTS,
   maxRedirects: 10,
@@ -52,9 +53,9 @@ export const DEFAULT_HTTP_CLIENT_OPTIONS: Omit<
   maxConnectionsPerOrigin: 4,
   maxOrigins: 1_024,
   maxRequestBodyBytes: 50 * 1024 * 1024,
-  maxRequestHeadersBytes: 64 * 1024,
-  maxResponseHeadersBytes: 64 * 1024,
-  defaultHeaders: {},
+  maxRequestFieldsBytes: 64 * 1024,
+  maxResponseFieldsBytes: 64 * 1024,
+  defaultFields: new HttpFields(),
   responseTransferLimits: DEFAULT_RESPONSE_TRANSFER_LIMITS,
   responseStorage: DEFAULT_RESPONSE_STORAGE,
   tls: DEFAULT_TLS_OPTIONS,

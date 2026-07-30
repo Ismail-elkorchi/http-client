@@ -1,10 +1,11 @@
 import { errors as undiciErrors } from "undici";
 import {
-  ResponseHeadersTimeoutError,
+  ResponseFieldsTimeoutError,
   TotalTimeoutError,
 } from "./deadlines.js";
 import { HttpClientError } from "./errors.js";
-import { RequestHeadersLimitError } from "./headers.js";
+import { HttpFields } from "./fields.js";
+import { RequestFieldsLimitError } from "./request-fields.js";
 import {
   RequestBodyLengthError,
   RequestBodyLimitError,
@@ -22,11 +23,14 @@ import {
   TransportClosedError,
 } from "./transport.js";
 import type {
-  ConnectionFacts,
+  HttpAttemptContext,
+  HttpAttemptResponseHead,
+  HttpAttemptResult,
+  HttpAttemptTransfer,
   HttpErrorCode,
+  HttpFailedAttempt,
   HttpFailure,
   HttpRedirect,
-  ResponseTransfer,
   StreamingHttpResponse,
 } from "./types.js";
 
@@ -92,9 +96,9 @@ export function classifyError(
       caught,
     );
   }
-  if (caught instanceof RequestHeadersLimitError) {
+  if (caught instanceof RequestFieldsLimitError) {
     return clientError(
-      "REQUEST_HEADERS_TOO_LARGE",
+      "REQUEST_FIELDS_TOO_LARGE",
       caught.message,
       url,
       caught,
@@ -125,9 +129,9 @@ export function classifyError(
         caught,
       );
     }
-    if (signal.reason instanceof ResponseHeadersTimeoutError) {
+    if (signal.reason instanceof ResponseFieldsTimeoutError) {
       return clientError(
-        "RESPONSE_HEADERS_TIMEOUT",
+        "RESPONSE_FIELDS_TIMEOUT",
         signal.reason.message,
         url,
         caught,
@@ -150,16 +154,16 @@ export function classifyError(
   }
   if (caught instanceof undiciErrors.HeadersTimeoutError) {
     return clientError(
-      "RESPONSE_HEADERS_TIMEOUT",
-      "The response headers timed out.",
+      "RESPONSE_FIELDS_TIMEOUT",
+      "The response field section timed out.",
       url,
       caught,
     );
   }
   if (caught instanceof undiciErrors.HeadersOverflowError) {
     return clientError(
-      "RESPONSE_HEADERS_TOO_LARGE",
-      "Response header fields exceeded the configured limit.",
+      "RESPONSE_FIELDS_TOO_LARGE",
+      "Response field lines exceeded the configured limit.",
       url,
       caught,
     );
@@ -200,64 +204,64 @@ export function clientError(
   return new HttpClientError(code, message, url, cause);
 }
 
-export function failureResult(
+export function failedAttempt(
+  context: HttpAttemptContext,
   error: HttpClientError,
-  url: string,
-  statusCode: number | null = null,
-  headers: Headers = new Headers(),
-  connection: ConnectionFacts | null = null,
-  transfer: ResponseTransfer | null = null,
-  statusMessage: string | null = null,
-): HttpFailure {
+  response: HttpAttemptResponseHead | null = null,
+  transfer: HttpAttemptTransfer | null = null,
+): HttpFailedAttempt {
   return {
     kind: "failure",
-    error,
-    finalUrl: url,
-    statusCode,
-    statusMessage,
-    headers,
-    redirects: [],
-    connection,
+    ...context,
+    response,
     transfer,
+    error,
+  };
+}
+
+export function failureResult(
+  context: HttpAttemptContext,
+  error: HttpClientError,
+  previousAttempts: readonly HttpAttemptResult[] = [],
+  redirects: readonly HttpRedirect[] = [],
+  response: HttpAttemptResponseHead | null = null,
+  transfer: HttpAttemptTransfer | null = null,
+): HttpFailure {
+  const attempt = failedAttempt(context, error, response, transfer);
+  return {
+    kind: "failure",
+    requestId: context.requestId,
+    error,
+    finalUrl: context.url,
+    statusCode: response?.statusCode ?? null,
+    statusMessage: response?.statusMessage ?? null,
+    fields: response?.fields ?? new HttpFields(),
+    redirects,
+    attempts: [...previousAttempts, attempt],
+    connection: response?.connection ?? null,
   };
 }
 
 export function failureFromResponse(
   response: StreamingHttpResponse,
   error: HttpClientError,
-  transfer: ResponseTransfer,
+  transfer: HttpAttemptTransfer,
 ): HttpFailure {
-  return {
-    kind: "failure",
-    error,
-    finalUrl: response.finalUrl,
+  const responseHead: HttpAttemptResponseHead = {
     statusCode: response.statusCode,
     statusMessage: response.statusMessage,
-    headers: response.headers,
-    redirects: response.redirects,
+    fields: response.fields,
     connection: response.connection,
+    timings: response.headTimings,
+  };
+  return failureResult(
+    response,
+    error,
+    response.previousAttempts,
+    response.redirects,
+    responseHead,
     transfer,
-  };
-}
-
-export function redirectFailure(
-  code: "REDIRECT_LOOP" | "REDIRECT_TARGET_REJECTED" | "TOO_MANY_REDIRECTS",
-  message: string,
-  url: string,
-  previous: StreamingHttpResponse,
-  transfer: ResponseTransfer,
-  redirects: readonly HttpRedirect[],
-  cause: unknown = null,
-): HttpFailure {
-  return {
-    ...failureFromResponse(
-      previous,
-      clientError(code, message, url, cause),
-      transfer,
-    ),
-    finalUrl: url,
-    redirects,
-  };
+  );
 }
 
 function systemErrorCode(value: unknown): string | null {

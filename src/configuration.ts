@@ -7,15 +7,20 @@ import {
   DEFAULT_TLS_OPTIONS,
 } from "./defaults.js";
 import { HttpConfigurationError } from "./errors.js";
-import { mergeRequestHeaders } from "./headers.js";
+import {
+  HttpFields,
+  httpFieldsToRecord,
+} from "./fields.js";
+import { validateHttpMethod } from "./method.js";
 import type {
   BufferedHttpRequestOptions,
-  CredentialProvider,
   HttpClientConfiguration,
+  HttpClientObserver,
   HttpClientOptions,
   HttpMethod,
   HttpRequestBody,
   HttpRequestOptions,
+  HttpSessionAdapter,
   HttpTimeouts,
   NetworkSafetyOptions,
   ProtocolPreference,
@@ -28,17 +33,6 @@ import type {
   TlsOptions,
 } from "./types.js";
 
-const HTTP_METHODS = new Set<HttpMethod>([
-  "GET",
-  "HEAD",
-  "POST",
-  "PUT",
-  "PATCH",
-  "DELETE",
-  "OPTIONS",
-  "TRACE",
-]);
-
 const PROTOCOL_PREFERENCES = new Set<ProtocolPreference>([
   "auto",
   "http1",
@@ -47,7 +41,7 @@ const PROTOCOL_PREFERENCES = new Set<ProtocolPreference>([
 
 export interface ResolvedRequestOptions {
   readonly method: HttpMethod;
-  readonly headers: Readonly<Record<string, string>>;
+  readonly fields: HttpFields;
   readonly body: HttpRequestBody | undefined;
   readonly signal: AbortSignal | undefined;
   readonly timeouts: Omit<HttpTimeouts, "connectMs">;
@@ -56,11 +50,12 @@ export interface ResolvedRequestOptions {
   readonly responseStorage: ResponseStorageOptions;
   readonly maxRequestBodyBytes: number;
   readonly maxRedirects: number;
-  readonly credentials: CredentialProvider | undefined;
+  readonly session: HttpSessionAdapter | undefined;
+  readonly observer: HttpClientObserver | undefined;
   readonly onInformationalResponse:
     | ((response: {
         readonly statusCode: number;
-        readonly headers: Headers;
+        readonly fields: HttpFields;
       }) => void)
     | undefined;
   readonly onRedirect:
@@ -89,14 +84,15 @@ export function resolveClientOptions(
       "maxConnectionsPerOrigin",
       "maxOrigins",
       "maxRequestBodyBytes",
-      "maxRequestHeadersBytes",
-      "maxResponseHeadersBytes",
-      "defaultHeaders",
+      "maxRequestFieldsBytes",
+      "maxResponseFieldsBytes",
+      "defaultFields",
       "responseTransferLimits",
       "responseStorage",
       "tls",
       "proxy",
       "networkSafety",
+      "observer",
       "resolver",
     ],
     "HTTP client configuration",
@@ -128,18 +124,21 @@ export function resolveClientOptions(
     maxRequestBodyBytes:
       configuration.maxRequestBodyBytes ??
       DEFAULT_HTTP_CLIENT_OPTIONS.maxRequestBodyBytes,
-    maxRequestHeadersBytes:
-      configuration.maxRequestHeadersBytes ??
-      DEFAULT_HTTP_CLIENT_OPTIONS.maxRequestHeadersBytes,
-    maxResponseHeadersBytes:
-      configuration.maxResponseHeadersBytes ??
-      DEFAULT_HTTP_CLIENT_OPTIONS.maxResponseHeadersBytes,
-    defaultHeaders: mergeRequestHeaders(configuration.defaultHeaders),
+    maxRequestFieldsBytes:
+      configuration.maxRequestFieldsBytes ??
+      DEFAULT_HTTP_CLIENT_OPTIONS.maxRequestFieldsBytes,
+    maxResponseFieldsBytes:
+      configuration.maxResponseFieldsBytes ??
+      DEFAULT_HTTP_CLIENT_OPTIONS.maxResponseFieldsBytes,
+    defaultFields: new HttpFields(configuration.defaultFields),
     responseTransferLimits,
     responseStorage,
     tls,
     proxy,
     networkSafety,
+    ...(configuration.observer === undefined
+      ? {}
+      : { observer: configuration.observer }),
     ...(configuration.resolver === undefined
       ? {}
       : { resolver: configuration.resolver }),
@@ -155,12 +154,12 @@ export function resolveClientOptions(
     options.maxRequestBodyBytes,
   );
   validatePositiveInteger(
-    "maxRequestHeadersBytes",
-    options.maxRequestHeadersBytes,
+    "maxRequestFieldsBytes",
+    options.maxRequestFieldsBytes,
   );
   validatePositiveInteger(
-    "maxResponseHeadersBytes",
-    options.maxResponseHeadersBytes,
+    "maxResponseFieldsBytes",
+    options.maxResponseFieldsBytes,
   );
   if (!PROTOCOL_PREFERENCES.has(options.protocolPreference)) {
     throw new HttpConfigurationError(
@@ -175,6 +174,7 @@ export function resolveClientOptions(
       "responseContentDecoding must be decode or preserve.",
     );
   }
+  validateObserver(configuration.observer);
   if (
     configuration.resolver !== undefined &&
     typeof configuration.resolver !== "function"
@@ -184,6 +184,11 @@ export function resolveClientOptions(
   if (proxy !== null && networkSafety.enabled) {
     throw new HttpConfigurationError(
       "A proxy cannot preserve target address pinning; networkSafety.enabled must be false.",
+    );
+  }
+  if (proxy !== null && options.protocolPreference === "http2") {
+    throw new HttpConfigurationError(
+      "Strict HTTP/2 cannot be guaranteed through a proxy.",
     );
   }
   return options;
@@ -199,7 +204,7 @@ export function resolveRequestOptions(
     options,
     [
       "method",
-      "headers",
+      "fields",
       "body",
       "signal",
       "timeouts",
@@ -207,7 +212,8 @@ export function resolveRequestOptions(
       "responseTransferLimits",
       "maxRequestBodyBytes",
       "maxRedirects",
-      "credentials",
+      "session",
+      "observer",
       "onInformationalResponse",
       "onRedirect",
       ...(buffered ? ["responseStorage"] : []),
@@ -215,9 +221,10 @@ export function resolveRequestOptions(
     "HTTP request options",
   );
   const method = options.method ?? "GET";
-  if (!HTTP_METHODS.has(method)) {
+  validateHttpMethod(method);
+  if (method === "CONNECT") {
     throw new HttpConfigurationError(
-      "method must be a supported uppercase HTTP method.",
+      "CONNECT requires a tunnel API and cannot be used as a request method.",
     );
   }
   validateRequestBody(options.body);
@@ -230,7 +237,8 @@ export function resolveRequestOptions(
     );
   }
   validateSignal(options.signal);
-  validateCredentialProvider(options.credentials);
+  validateSessionAdapter(options.session);
+  validateObserver(options.observer);
   if (
     options.onInformationalResponse !== undefined &&
     typeof options.onInformationalResponse !== "function"
@@ -266,7 +274,7 @@ export function resolveRequestOptions(
       : client.responseStorage;
   return {
     method,
-    headers: mergeRequestHeaders(options.headers),
+    fields: new HttpFields(options.fields),
     body: options.body,
     signal: options.signal,
     timeouts: resolveRequestTimeouts(options.timeouts, client.timeouts),
@@ -278,7 +286,8 @@ export function resolveRequestOptions(
     responseStorage,
     maxRequestBodyBytes,
     maxRedirects,
-    credentials: options.credentials,
+    session: options.session,
+    observer: options.observer ?? client.observer,
     onInformationalResponse: options.onInformationalResponse,
     onRedirect: options.onRedirect,
   };
@@ -321,18 +330,18 @@ function resolveTimeouts(
       [
         "totalMs",
         "connectMs",
-        "responseHeadersMs",
+        "responseFieldsMs",
         "responseBodyProgressMs",
       ],
       "timeouts",
     );
   }
   const value = { ...DEFAULT_HTTP_TIMEOUTS, ...overrides };
-  validatePositiveInteger("timeouts.totalMs", value.totalMs);
+  validateOptionalPositiveInteger("timeouts.totalMs", value.totalMs);
   validatePositiveInteger("timeouts.connectMs", value.connectMs);
   validatePositiveInteger(
-    "timeouts.responseHeadersMs",
-    value.responseHeadersMs,
+    "timeouts.responseFieldsMs",
+    value.responseFieldsMs,
   );
   validatePositiveInteger(
     "timeouts.responseBodyProgressMs",
@@ -349,22 +358,25 @@ function resolveRequestTimeouts(
   if (overrides !== undefined) {
     assertKnownKeys(
       overrides,
-      ["totalMs", "responseHeadersMs", "responseBodyProgressMs"],
+      ["totalMs", "responseFieldsMs", "responseBodyProgressMs"],
       "request timeouts",
     );
   }
   const value = {
-    totalMs: overrides?.totalMs ?? defaults.totalMs,
-    responseHeadersMs:
-      overrides?.responseHeadersMs ?? defaults.responseHeadersMs,
+    totalMs:
+      overrides?.totalMs === undefined
+        ? defaults.totalMs
+        : overrides.totalMs,
+    responseFieldsMs:
+      overrides?.responseFieldsMs ?? defaults.responseFieldsMs,
     responseBodyProgressMs:
       overrides?.responseBodyProgressMs ??
       defaults.responseBodyProgressMs,
   };
-  validatePositiveInteger("timeouts.totalMs", value.totalMs);
+  validateOptionalPositiveInteger("timeouts.totalMs", value.totalMs);
   validatePositiveInteger(
-    "timeouts.responseHeadersMs",
-    value.responseHeadersMs,
+    "timeouts.responseFieldsMs",
+    value.responseFieldsMs,
   );
   validatePositiveInteger(
     "timeouts.responseBodyProgressMs",
@@ -578,7 +590,7 @@ function resolveProxy(
   assertObject(configuration, "proxy configuration");
   assertKnownKeys(
     configuration,
-    ["url", "headers", "tls"],
+    ["url", "fields", "tls"],
     "proxy configuration",
   );
   let url: URL;
@@ -602,18 +614,19 @@ function resolveProxy(
       "proxy.url must contain only a proxy origin.",
     );
   }
-  const headers = mergeRequestHeaders(configuration.headers);
+  const fields = new HttpFields(configuration.fields);
+  httpFieldsToRecord(fields);
   if (
     (url.username !== "" || url.password !== "") &&
-    headers["proxy-authorization"] !== undefined
+    fields.has("proxy-authorization")
   ) {
     throw new HttpConfigurationError(
-      "Proxy credentials must use either proxy.url or proxy headers.",
+      "Proxy credentials must use either proxy.url or proxy fields.",
     );
   }
   return {
     url: url.href,
-    headers,
+    fields,
     tls: resolveTls(configuration.tls),
   };
 }
@@ -664,18 +677,31 @@ function validateSignal(value: AbortSignal | undefined): void {
   }
 }
 
-function validateCredentialProvider(
-  value: CredentialProvider | undefined,
+function validateSessionAdapter(
+  value: HttpSessionAdapter | undefined,
 ): void {
   if (value === undefined) return;
   if (
     typeof value !== "object" ||
     value === null ||
-    typeof value.requestHeaders !== "function" ||
-    typeof value.captureResponse !== "function"
+    typeof value.prepareRequest !== "function" ||
+    typeof value.acceptResponse !== "function"
   ) {
     throw new HttpConfigurationError(
-      "credentials must implement requestHeaders and captureResponse.",
+      "session must implement prepareRequest and acceptResponse.",
+    );
+  }
+}
+
+function validateObserver(value: HttpClientObserver | undefined): void {
+  if (value === undefined) return;
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    typeof value.onEvent !== "function"
+  ) {
+    throw new HttpConfigurationError(
+      "observer must implement onEvent.",
     );
   }
 }
@@ -714,6 +740,13 @@ function validatePositiveInteger(name: string, value: number): void {
       `${name} must be a positive safe integer.`,
     );
   }
+}
+
+function validateOptionalPositiveInteger(
+  name: string,
+  value: number | null,
+): void {
+  if (value !== null) validatePositiveInteger(name, value);
 }
 
 function validateNonNegativeInteger(name: string, value: number): void {

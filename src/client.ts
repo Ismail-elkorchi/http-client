@@ -5,21 +5,25 @@ import {
   validateRedirectDecision,
   type ResolvedRequestOptions,
 } from "./configuration.js";
-import { HttpConfigurationError } from "./errors.js";
+import {
+  HttpConfigurationError,
+  type HttpClientError,
+} from "./errors.js";
 import {
   awaitWithSignal,
   PhaseDeadline,
   RequestDeadline,
-  ResponseHeadersTimeoutError,
+  ResponseFieldsTimeoutError,
 } from "./deadlines.js";
+import { mergeHttpFields } from "./fields.js";
 import {
   applyContentLength,
-  enforceRequestHeadersLimit,
-  mergeRequestHeaders,
+  enforceRequestFieldsLimit,
   requestAfterRedirect,
   type RedirectedRequest,
-} from "./headers.js";
+} from "./request-fields.js";
 import { NetworkSafetyPolicy } from "./network-policy.js";
+import { emitHttpClientEvent } from "./observer.js";
 import {
   prepareRequestBody,
   RequestBodyLimitError,
@@ -28,18 +32,21 @@ import {
   classifyError,
   clientError,
   failureResult,
-  failureFromResponse,
-  redirectFailure,
 } from "./outcomes.js";
 import { createStreamingBody } from "./response-stream.js";
 import { UndiciTransport } from "./transport.js";
 import type {
   BufferedHttpRequestOptions,
   BufferedHttpResult,
+  HttpAttemptContext,
+  HttpAttemptResponseHead,
+  HttpAttemptResult,
   HttpClientConfiguration,
   HttpClientOptions,
+  HttpFailure,
   HttpRedirect,
   HttpRequestOptions,
+  HttpResponseCompletion,
   StreamingHttpResponse,
   StreamingHttpResult,
 } from "./types.js";
@@ -53,6 +60,7 @@ export class NodeHttpClient {
   private readonly activeDeadlines = new Set<RequestDeadline>();
   private readonly exchangeWaiters = new Set<() => void>();
   private pendingExchanges = 0;
+  private requestCounter = 0;
   private state: "open" | "closing" | "closed" = "open";
   private shutdown: Promise<void> | null = null;
 
@@ -140,7 +148,7 @@ export class NodeHttpClient {
     if (this.state !== "open") {
       throw new HttpClientStateError("The HTTP client is not open.");
     }
-    const startedAt = performance.now();
+    const requestId = ++this.requestCounter;
     const deadline = new RequestDeadline(
       options.timeouts.totalMs,
       options.signal,
@@ -152,23 +160,28 @@ export class NodeHttpClient {
       result = followRedirects
         ? await this.fetchWithRedirects(
             rawUrl,
+            requestId,
             options,
             deadline.signal,
-            startedAt,
           )
         : await this.requestExchange(
             rawUrl,
             {
               method: options.method,
-              headers: mergeRequestHeaders(
-                this.options.defaultHeaders,
-                options.headers,
+              fields: mergeHttpFields(
+                this.options.defaultFields,
+                options.fields,
               ),
               body: options.body,
             },
+            {
+              requestId,
+              attemptIndex: 0,
+              method: options.method,
+              url: safeInputUrl(rawUrl),
+            },
             options,
             deadline.signal,
-            startedAt,
             false,
           );
     } catch (caught) {
@@ -181,74 +194,92 @@ export class NodeHttpClient {
       this.releaseDeadline(deadline);
       return result;
     }
-    const registered = this.registerResponse(result, deadline);
-    return registered;
+    return this.registerResponse(result, deadline);
   }
 
   private async fetchWithRedirects(
     rawUrl: string | URL,
+    requestId: number,
     options: ResolvedRequestOptions,
     signal: AbortSignal,
-    startedAt: number,
   ): Promise<StreamingHttpResult> {
     const redirects: HttpRedirect[] = [];
+    const attempts: HttpAttemptResult[] = [];
     const visited = new Set<string>();
     let currentUrl: URL;
     try {
       currentUrl = parseUrl(rawUrl);
     } catch (caught) {
       const errorUrl = safeErrorUrl(caught);
-      return failureResult(
-        clientError(
-          "INVALID_URL",
-          caught instanceof UrlCredentialsError
-            ? caught.message
-            : "The request URL is invalid.",
-          errorUrl,
-          caught,
-        ),
-        errorUrl,
+      return this.failure(
+        {
+          requestId,
+          attemptIndex: 0,
+          method: options.method,
+          url: errorUrl,
+        },
+        invalidUrlError(caught, errorUrl),
+        options,
       );
     }
     visited.add(loopIdentity(currentUrl));
     let request: RedirectedRequest = {
       method: options.method,
-      headers: mergeRequestHeaders(
-        this.options.defaultHeaders,
-        options.headers,
+      fields: mergeHttpFields(
+        this.options.defaultFields,
+        options.fields,
       ),
       body: options.body,
     };
 
     for (let hopIndex = 0; ; hopIndex += 1) {
-      const result = await this.requestExchange(
+      const context: HttpAttemptContext = {
+        requestId,
+        attemptIndex: hopIndex,
+        method: request.method,
+        url: currentUrl.href,
+      };
+      const exchange = await this.requestExchange(
         currentUrl,
         request,
+        context,
         options,
         signal,
-        startedAt,
         true,
       );
-      if (result.kind === "failure") {
-        return { ...result, redirects };
+      if (exchange.kind === "failure") {
+        return {
+          ...exchange,
+          redirects,
+          attempts: [...attempts, ...exchange.attempts],
+        };
       }
-      const location = result.headers.get("location");
+      const result: StreamingHttpResponse = {
+        ...exchange,
+        redirects: [...redirects],
+        previousAttempts: [...attempts],
+      };
+      const location = result.fields.first("location");
       if (
         !REDIRECT_STATUSES.has(result.statusCode) ||
         location === null
       ) {
-        return { ...result, redirects };
+        return result;
       }
 
       result.cancel();
       const completion = await result.completion;
       if (hopIndex >= options.maxRedirects) {
-        return redirectFailure(
-          "TOO_MANY_REDIRECTS",
-          "Redirect limit exceeded.",
-          currentUrl.href,
+        observeAttemptCompletion(options, completion);
+        return redirectPolicyFailure(
           result,
-          completion.transfer,
+          completion,
+          clientError(
+            "TOO_MANY_REDIRECTS",
+            "Redirect limit exceeded.",
+            currentUrl.href,
+          ),
+          currentUrl.href,
           redirects,
         );
       }
@@ -258,14 +289,18 @@ export class NodeHttpClient {
         target = parseUrl(new URL(location, currentUrl));
         assertSupportedProtocol(target);
       } catch (caught) {
-        return redirectFailure(
-          "REDIRECT_TARGET_REJECTED",
-          "The redirect target is invalid.",
-          currentUrl.href,
+        observeAttemptCompletion(options, completion);
+        return redirectPolicyFailure(
           result,
-          completion.transfer,
+          completion,
+          clientError(
+            "REDIRECT_TARGET_REJECTED",
+            "The redirect target is invalid.",
+            currentUrl.href,
+            caught,
+          ),
+          currentUrl.href,
           redirects,
-          caught,
         );
       }
       const redirect: HttpRedirect = {
@@ -276,12 +311,16 @@ export class NodeHttpClient {
       };
       const nextRedirects = [...redirects, redirect];
       if (visited.has(loopIdentity(target))) {
-        return redirectFailure(
-          "REDIRECT_LOOP",
-          "Redirect loop detected.",
-          target.href,
+        observeAttemptCompletion(options, completion);
+        return redirectPolicyFailure(
           result,
-          completion.transfer,
+          completion,
+          clientError(
+            "REDIRECT_LOOP",
+            "Redirect loop detected.",
+            target.href,
+          ),
+          target.href,
           nextRedirects,
         );
       }
@@ -304,38 +343,53 @@ export class NodeHttpClient {
         );
       } catch (caught) {
         if (caught instanceof HttpConfigurationError) throw caught;
-        if (signal.aborted) {
-          return {
-            ...failureFromResponse(
-              result,
-              classifyError(caught, target.href, signal, false),
-              completion.transfer,
-            ),
-            finalUrl: target.href,
-            redirects: nextRedirects,
-          };
-        }
-        return redirectFailure(
-          "REDIRECT_TARGET_REJECTED",
-          "The redirect callback failed.",
-          target.href,
+        const error = signal.aborted
+          ? classifyError(caught, target.href, signal, false)
+          : clientError(
+              "REDIRECT_TARGET_REJECTED",
+              "The redirect callback failed.",
+              target.href,
+              caught,
+            );
+        observeAttemptCompletion(options, completion);
+        return redirectPolicyFailure(
           result,
-          completion.transfer,
+          completion,
+          error,
+          target.href,
           nextRedirects,
-          caught,
         );
       }
       if (decision?.action === "reject") {
-        return redirectFailure(
-          "REDIRECT_TARGET_REJECTED",
-          decision.reason,
-          target.href,
+        observeAttemptCompletion(options, completion);
+        return redirectPolicyFailure(
           result,
-          completion.transfer,
+          completion,
+          clientError(
+            "REDIRECT_TARGET_REJECTED",
+            decision.reason,
+            target.href,
+          ),
+          target.href,
           nextRedirects,
         );
       }
 
+      const redirectAttempt = {
+        kind: "redirect",
+        requestId: completion.requestId,
+        attemptIndex: completion.attemptIndex,
+        method: completion.method,
+        url: completion.url,
+        response: completion.response,
+        transfer: completion.transfer,
+        redirect,
+      } as const;
+      emitHttpClientEvent(options.observer, {
+        kind: "attempt-completed",
+        attempt: redirectAttempt,
+      });
+      attempts.push(redirectAttempt);
       redirects.push(redirect);
       visited.add(loopIdentity(target));
       request = requestAfterRedirect(
@@ -351,9 +405,9 @@ export class NodeHttpClient {
   private async requestExchange(
     rawUrl: string | URL,
     request: RedirectedRequest,
+    initialContext: HttpAttemptContext,
     options: ResolvedRequestOptions,
     signal: AbortSignal,
-    requestStartedAt: number,
     skipRedirectBodyDecoding: boolean,
   ): Promise<StreamingHttpResult> {
     const exchangeStartedAt = performance.now();
@@ -362,52 +416,53 @@ export class NodeHttpClient {
       url = parseUrl(rawUrl);
     } catch (caught) {
       const errorUrl = safeErrorUrl(caught);
-      return failureResult(
-        clientError(
-          "INVALID_URL",
-          caught instanceof UrlCredentialsError
-            ? caught.message
-            : "The request URL is invalid.",
-          errorUrl,
-          caught,
-        ),
-        errorUrl,
+      const context = { ...initialContext, url: errorUrl };
+      return this.failure(
+        context,
+        invalidUrlError(caught, errorUrl),
+        options,
       );
     }
+    const context = { ...initialContext, url: url.href };
     try {
       assertSupportedProtocol(url);
     } catch (caught) {
-      return failureResult(
+      return this.failure(
+        context,
         clientError(
           "UNSUPPORTED_PROTOCOL",
           "Only HTTP and HTTPS URLs are supported.",
           url.href,
           caught,
         ),
-        url.href,
+        options,
       );
     }
 
-    let credentialHeaders: Readonly<Record<string, string>> | undefined;
+    let sessionFields;
     try {
-      credentialHeaders =
-        options.credentials === undefined
+      sessionFields =
+        options.session === undefined
           ? undefined
           : await awaitWithSignal(
-              options.credentials.requestHeaders(url.href),
+              options.session.prepareRequest({
+                ...context,
+                fields: request.fields,
+              }),
               signal,
             );
     } catch (caught) {
-      return failureResult(
+      return this.failure(
+        context,
         signal.aborted
           ? classifyError(caught, url.href, signal, false)
           : clientError(
               "NETWORK_FAILURE",
-              "Request credentials could not be prepared.",
+              "Session state could not prepare the request.",
               url.href,
               caught,
             ),
-        url.href,
+        options,
       );
     }
 
@@ -419,132 +474,160 @@ export class NodeHttpClient {
       );
     } catch (caught) {
       if (caught instanceof RequestBodyLimitError) {
-        return failureResult(
+        return this.failure(
+          context,
           clientError(
             "REQUEST_BODY_TOO_LARGE",
             caught.message,
             url.href,
             caught,
           ),
-          url.href,
+          options,
         );
       }
       throw caught;
     }
-    const mergedHeaders = mergeRequestHeaders(
-      request.headers,
-      credentialHeaders,
-    );
-    const decodingHeaders =
+    const mergedFields = mergeHttpFields(request.fields, sessionFields);
+    const decodingFields =
       options.responseContentDecoding === "decode" &&
-      mergedHeaders["accept-encoding"] === undefined
-        ? {
-            ...mergedHeaders,
-            "accept-encoding": "zstd, br, gzip, deflate",
-          }
-        : mergedHeaders;
+      !mergedFields.has("accept-encoding")
+        ? mergeHttpFields(mergedFields, [
+            {
+              name: "accept-encoding",
+              value: "zstd, br, gzip, deflate",
+            },
+          ])
+        : mergedFields;
     if (
       preparedBody.contentType !== null &&
-      decodingHeaders["content-type"] !== undefined
+      decodingFields.has("content-type")
     ) {
       throw new HttpConfigurationError(
         "Multipart content-type is controlled by the HTTP transport.",
       );
     }
-    const representationHeaders =
+    const representationFields =
       preparedBody.contentType === null
-        ? decodingHeaders
-        : {
-            ...decodingHeaders,
-            "content-type": preparedBody.contentType,
-          };
-    const headers = applyContentLength(
-      representationHeaders,
+        ? decodingFields
+        : mergeHttpFields(decodingFields, [
+            { name: "content-type", value: preparedBody.contentType },
+          ]);
+    const fields = applyContentLength(
+      representationFields,
       request.body !== undefined,
       preparedBody.contentLength,
     );
     try {
-      enforceRequestHeadersLimit(
-        headers,
-        this.options.maxRequestHeadersBytes,
+      enforceRequestFieldsLimit(
+        fields,
+        this.options.maxRequestFieldsBytes,
       );
     } catch (caught) {
-      return failureResult(
+      return this.failure(
+        context,
         classifyError(caught, url.href, signal, false),
-        url.href,
+        options,
       );
     }
+    emitHttpClientEvent(options.observer, {
+      kind: "attempt-started",
+      context,
+      fields,
+    });
 
     let response;
-    const headersDeadline = new PhaseDeadline(
-      options.timeouts.responseHeadersMs,
+    const fieldsDeadline = new PhaseDeadline(
+      options.timeouts.responseFieldsMs,
       signal,
-      new ResponseHeadersTimeoutError(options.timeouts.responseHeadersMs),
+      new ResponseFieldsTimeoutError(options.timeouts.responseFieldsMs),
     );
     try {
       response = await this.transport.request(url, {
         method: request.method,
-        headers,
+        fields,
         createBody: preparedBody.create,
-        signal: headersDeadline.signal,
-        responseHeadersTimeoutMs: options.timeouts.responseHeadersMs,
+        signal: fieldsDeadline.signal,
+        responseFieldsTimeoutMs: options.timeouts.responseFieldsMs,
         responseBodyInactivityTimeoutMs:
           options.timeouts.responseBodyProgressMs,
+        onRequestBodyProgress: (sentBytes) => {
+          emitHttpClientEvent(options.observer, {
+            kind: "request-body-progress",
+            context,
+            sentBytes,
+          });
+        },
         onInformationalResponse:
           options.onInformationalResponse === undefined
             ? undefined
-            : (statusCode, headers) => {
-                options.onInformationalResponse?.({ statusCode, headers });
+            : (statusCode, informationalFields) => {
+                options.onInformationalResponse?.({
+                  statusCode,
+                  fields: informationalFields,
+                });
               },
       });
     } catch (caught) {
-      return failureResult(
-        classifyError(caught, url.href, headersDeadline.signal, false),
-        url.href,
+      return this.failure(
+        context,
+        classifyError(caught, url.href, fieldsDeadline.signal, false),
+        options,
       );
     } finally {
-      headersDeadline.dispose();
+      fieldsDeadline.dispose();
     }
 
+    const headTimings = {
+      dnsMs: response.dnsMs,
+      responseFieldsMs: performance.now() - exchangeStartedAt,
+    };
+    const responseHead: HttpAttemptResponseHead = {
+      statusCode: response.statusCode,
+      statusMessage: response.statusMessage,
+      fields: response.fields,
+      connection: response.connection,
+      timings: headTimings,
+    };
+    emitHttpClientEvent(options.observer, {
+      kind: "response-started",
+      context,
+      response: responseHead,
+    });
+
     try {
-      if (options.credentials !== undefined) {
+      if (options.session !== undefined) {
         await awaitWithSignal(
-          options.credentials.captureResponse(
-            url.href,
-            new Headers(response.headers),
-          ),
+          options.session.acceptResponse({
+            ...context,
+            statusCode: response.statusCode,
+            statusMessage: response.statusMessage,
+            fields: response.fields,
+          }),
           signal,
         );
       }
     } catch (caught) {
       cancelNodeBody(response.body, caught);
-      return failureResult(
+      return this.failure(
+        context,
         signal.aborted
           ? classifyError(caught, url.href, signal, false)
           : clientError(
               "NETWORK_FAILURE",
-              "Response credentials could not be captured.",
+              "Session state could not accept the response.",
               url.href,
               caught,
             ),
-        url.href,
-        response.statusCode,
-        response.headers,
-        response.connection,
-        null,
-        response.statusMessage,
+        options,
+        responseHead,
       );
     }
 
-    const headTimings = {
-      dnsMs: response.dnsMs,
-      responseHeadersMs: performance.now() - exchangeStartedAt,
-    };
     let streamingBody;
     const isFollowedRedirect =
       skipRedirectBodyDecoding &&
       REDIRECT_STATUSES.has(response.statusCode) &&
-      response.headers.has("location");
+      response.fields.has("location");
     try {
       streamingBody = createStreamingBody({
         source: response.body,
@@ -552,14 +635,24 @@ export class NodeHttpClient {
           options.responseContentDecoding === "decode" &&
           !isFollowedRedirect &&
           responseHasContent(request.method, response.statusCode)
-            ? response.headers.get("content-encoding") ?? undefined
+            ? response.fields.all("content-encoding")
             : undefined,
         limits: options.responseTransferLimits,
         responseBodyProgressTimeoutMs:
           options.timeouts.responseBodyProgressMs,
         signal,
-        requestStartedAt,
-        headTimings,
+        attemptStartedAt: exchangeStartedAt,
+        context,
+        response: responseHead,
+        observer: options.observer,
+        onCompletion: isFollowedRedirect
+          ? ignoreAttemptCompletion
+          : (attempt) => {
+              emitHttpClientEvent(options.observer, {
+                kind: "attempt-completed",
+                attempt,
+              });
+            },
         requestBodyBytesSent: response.requestBodyBytesSent,
         trailers: response.trailers,
         classifyFailure: (caught, decoding) =>
@@ -567,29 +660,45 @@ export class NodeHttpClient {
       });
     } catch (caught) {
       cancelNodeBody(response.body, caught);
-      return failureResult(
+      return this.failure(
+        context,
         classifyError(caught, url.href, signal, false),
-        url.href,
-        response.statusCode,
-        response.headers,
-        response.connection,
-        null,
-        response.statusMessage,
+        options,
+        responseHead,
       );
     }
     return {
       kind: "response",
+      ...context,
       statusCode: response.statusCode,
       statusMessage: response.statusMessage,
       finalUrl: url.href,
-      headers: response.headers,
+      fields: response.fields,
       redirects: [],
+      previousAttempts: [],
       connection: response.connection,
       headTimings,
       body: streamingBody.body,
       completion: streamingBody.completion,
       cancel: streamingBody.cancel,
     };
+  }
+
+  private failure(
+    context: HttpAttemptContext,
+    error: HttpClientError,
+    options: ResolvedRequestOptions,
+    response: HttpAttemptResponseHead | null = null,
+  ): HttpFailure {
+    const result = failureResult(context, error, [], [], response);
+    const attempt = result.attempts[0];
+    if (attempt !== undefined) {
+      emitHttpClientEvent(options.observer, {
+        kind: "attempt-completed",
+        attempt,
+      });
+    }
+    return result;
   }
 
   private registerResponse(
@@ -646,6 +755,27 @@ export class HttpClientStateError extends Error {
   public override readonly name = "HttpClientStateError";
 }
 
+function redirectPolicyFailure(
+  response: StreamingHttpResponse,
+  completion: HttpResponseCompletion,
+  error: HttpClientError,
+  finalUrl: string,
+  redirects: readonly HttpRedirect[],
+): HttpFailure {
+  return {
+    kind: "failure",
+    requestId: response.requestId,
+    error,
+    finalUrl,
+    statusCode: response.statusCode,
+    statusMessage: response.statusMessage,
+    fields: response.fields,
+    redirects,
+    attempts: [...response.previousAttempts, completion],
+    connection: response.connection,
+  };
+}
+
 function parseUrl(value: string | URL): URL {
   if (typeof value !== "string" && !(value instanceof URL)) {
     throw new TypeError("Request URL must be a string or URL.");
@@ -673,7 +803,10 @@ function loopIdentity(url: URL): string {
 }
 
 function cancelNodeBody(
-  body: { on(event: "error", listener: () => undefined): unknown; destroy(reason?: Error): unknown },
+  body: {
+    on(event: "error", listener: () => undefined): unknown;
+    destroy(reason?: Error): unknown;
+  },
   caught: unknown,
 ): void {
   body.on("error", ignoreFailure);
@@ -703,7 +836,7 @@ class UrlCredentialsError extends Error {
 
   public constructor(safeUrl: string) {
     super(
-      "Request URL credentials are not accepted; use request headers or a credential provider.",
+      "Request URL credentials are not accepted; use request fields or a session adapter.",
     );
     this.safeUrl = safeUrl;
   }
@@ -712,3 +845,37 @@ class UrlCredentialsError extends Error {
 function safeErrorUrl(caught: unknown): string {
   return caught instanceof UrlCredentialsError ? caught.safeUrl : "";
 }
+
+function safeInputUrl(value: string | URL): string {
+  try {
+    return parseUrl(value).href;
+  } catch (caught) {
+    return safeErrorUrl(caught);
+  }
+}
+
+function invalidUrlError(
+  caught: unknown,
+  url: string,
+): HttpClientError {
+  return clientError(
+    "INVALID_URL",
+    caught instanceof UrlCredentialsError
+      ? caught.message
+      : "The request URL is invalid.",
+    url,
+    caught,
+  );
+}
+
+function observeAttemptCompletion(
+  options: ResolvedRequestOptions,
+  attempt: HttpResponseCompletion,
+): void {
+  emitHttpClientEvent(options.observer, {
+    kind: "attempt-completed",
+    attempt,
+  });
+}
+
+function ignoreAttemptCompletion(): void {}

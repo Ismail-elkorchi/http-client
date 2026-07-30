@@ -396,7 +396,9 @@ test("validates proxy and TLS configurations", () => {
         networkSafety: { enabled: false },
         proxy: {
           url: "http://user:password@proxy.example/",
-          headers: { "proxy-authorization": "Bearer token" },
+          fields: [
+            { name: "proxy-authorization", value: "Bearer token" },
+          ],
         },
       }),
     HttpConfigurationError,
@@ -407,7 +409,9 @@ test("validates proxy and TLS configurations", () => {
         networkSafety: { enabled: false },
         proxy: {
           url: "http://:password@proxy.example/",
-          headers: { "proxy-authorization": "Bearer token" },
+          fields: [
+            { name: "proxy-authorization", value: "Bearer token" },
+          ],
         },
       }),
     HttpConfigurationError,

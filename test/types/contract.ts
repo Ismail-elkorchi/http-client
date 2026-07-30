@@ -1,4 +1,6 @@
 import {
+  defineHttpMethod,
+  HttpFields,
   NodeHttpClient,
   type BufferedHttpResult,
   type HttpRequestBody,
@@ -47,11 +49,40 @@ async function buffered(client: NodeHttpClient): Promise<void> {
   );
   if (result.kind === "response") {
     const size: number = result.body.size;
-    const received: number = result.transfer.decodedBytesReceived;
+    const finalAttempt = result.attempts.at(-1);
+    const received: number =
+      finalAttempt?.transfer?.decodedBytesReceived ?? 0;
     void size;
     void received;
   }
 }
+
+const fields = new HttpFields([
+  { name: "set-cookie", value: "first=1" },
+  { name: "set-cookie", value: "second=2" },
+]);
+const cookies: readonly string[] = fields.all("set-cookie");
+void cookies;
+
+const extensionMethod = defineHttpMethod("PROPFIND");
+void new NodeHttpClient({ timeouts: { totalMs: null } }).request(
+  "https://example.com/",
+  {
+    method: extensionMethod,
+    body: { kind: "text", text: "query" },
+  },
+);
+
+void new NodeHttpClient().request("https://example.com/", {
+  // @ts-expect-error Extension methods must pass through defineHttpMethod.
+  method: "PROPFIND",
+});
+
+void new NodeHttpClient().request("https://example.com/", {
+  method: "GET",
+  // @ts-expect-error GET is a bodyless request state.
+  body: { kind: "text", text: "invalid" },
+});
 
 void streaming;
 void buffered;

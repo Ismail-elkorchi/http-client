@@ -13,7 +13,7 @@ import {
   urlFor,
 } from "./support.mjs";
 
-test("strips sensitive headers across origins and rewrites POST redirects", async () => {
+test("strips sensitive fields across origins and rewrites POST redirects", async () => {
   let receivedHeaders = null;
   let receivedMethod = null;
   const target = await listen(
@@ -36,12 +36,12 @@ test("strips sensitive headers across origins and rewrites POST redirects", asyn
     const result = await client.fetchBuffered(urlFor(source, "/start"), {
       method: "POST",
       body: { kind: "text", text: "payload" },
-      headers: {
-        authorization: "Bearer secret",
-        cookie: "session=secret",
-        "proxy-authorization": "Basic secret",
-        "content-type": "text/plain",
-      },
+      fields: [
+        { name: "authorization", value: "Bearer secret" },
+        { name: "cookie", value: "session=secret" },
+        { name: "proxy-authorization", value: "Basic secret" },
+        { name: "content-type", value: "text/plain" },
+      ],
     });
     assert.equal(result.kind, "response");
     assert.equal(receivedMethod, "GET");
@@ -100,7 +100,9 @@ test("creates a fresh request stream when a redirect preserves the body", async 
     assert.equal(result.kind, "response");
     assert.equal(createCount, 2);
     assert.equal(observedBody, "payload");
-    assert.equal(result.transfer.requestBodyBytesSent, 7);
+    const finalAttempt = result.attempts.at(-1);
+    assert.equal(finalAttempt?.kind, "complete");
+    assert.equal(finalAttempt?.transfer.requestBodyBytesSent, 7);
   } finally {
     await client.close();
     await closeServer(server);
@@ -174,7 +176,7 @@ test("cancels the upload source when the request deadline expires", async () => 
   );
   const client = new NodeHttpClient({
     networkSafety: { allowLocalhost: true },
-    timeouts: { totalMs: 40, responseHeadersMs: 500 },
+    timeouts: { totalMs: 40, responseFieldsMs: 500 },
   });
   try {
     const result = await client.request(urlFor(server), {
@@ -305,7 +307,7 @@ test("does not create a streamed upload before network admission", async () => {
   }
 });
 
-test("captures credentials before preparing the next redirect request", async () => {
+test("updates session state before preparing the next redirect request", async () => {
   const captured = [];
   const server = await listen(
     http.createServer((request, response) => {
@@ -325,14 +327,14 @@ test("captures credentials before preparing the next redirect request", async ()
   });
   try {
     const result = await client.fetchBuffered(urlFor(server, "/start"), {
-      credentials: {
-        async requestHeaders() {
+      session: {
+        async prepareRequest() {
           return captured.length === 0
-            ? {}
-            : { cookie: "first=1; second=2" };
+            ? []
+            : [{ name: "cookie", value: "first=1; second=2" }];
         },
-        async captureResponse(_url, headers) {
-          captured.push(...headers.getSetCookie());
+        async acceptResponse({ fields }) {
+          captured.push(...fields.all("set-cookie"));
         },
       },
     });
@@ -372,11 +374,11 @@ test("applies the total deadline to asynchronous consumer hooks", async () => {
     const preparation = await client.request(
       urlFor(server, "/preparation"),
       {
-        credentials: {
-          async requestHeaders() {
+        session: {
+          async prepareRequest() {
             return await new Promise(() => {});
           },
-          async captureResponse() {},
+          async acceptResponse() {},
         },
       },
     );
@@ -385,11 +387,11 @@ test("applies the total deadline to asynchronous consumer hooks", async () => {
     assert.equal(requests, 0);
 
     const capture = await client.request(urlFor(server, "/capture"), {
-      credentials: {
-        async requestHeaders() {
-          return {};
+      session: {
+        async prepareRequest() {
+          return [];
         },
-        async captureResponse() {
+        async acceptResponse() {
           await new Promise(() => {});
         },
       },
@@ -421,7 +423,9 @@ test("rejects invalid request boundaries before network activity", async () => {
     );
     await assert.rejects(
       client.request("http://127.0.0.1/", {
-        headers: { test: "value\r\ninjected: yes" },
+        fields: [
+          { name: "test", value: "value\r\ninjected: yes" },
+        ],
       }),
       HttpConfigurationError,
     );
@@ -429,7 +433,7 @@ test("rejects invalid request boundaries before network activity", async () => {
       client.request("http://127.0.0.1/", {
         method: "POST",
         body: { kind: "text", text: "payload" },
-        headers: { "content-length": "8" },
+        fields: [{ name: "content-length", value: "8" }],
       }),
       HttpConfigurationError,
     );
@@ -462,7 +466,9 @@ test("rejects invalid request boundaries before network activity", async () => {
       client.request("http://127.0.0.1/", {
         method: "POST",
         body: { kind: "multipart", parts: [] },
-        headers: { "content-type": "multipart/form-data" },
+        fields: [
+          { name: "content-type", value: "multipart/form-data" },
+        ],
       }),
       HttpConfigurationError,
     );
@@ -471,7 +477,7 @@ test("rejects invalid request boundaries before network activity", async () => {
   }
 });
 
-test("enforces request and response header limits", async () => {
+test("enforces request and response field limits", async () => {
   let requests = 0;
   const server = await listen(
     http.createServer((_request, response) => {
@@ -481,24 +487,24 @@ test("enforces request and response header limits", async () => {
     }),
   );
   const requestClient = new NodeHttpClient({
-    maxRequestHeadersBytes: 64,
+    maxRequestFieldsBytes: 64,
     networkSafety: { allowLocalhost: true },
   });
   const responseClient = new NodeHttpClient({
-    maxResponseHeadersBytes: 128,
+    maxResponseFieldsBytes: 128,
     networkSafety: { allowLocalhost: true },
   });
   try {
     const request = await requestClient.request(urlFor(server), {
-      headers: { "x-large": "q".repeat(128) },
+      fields: [{ name: "x-large", value: "q".repeat(128) }],
     });
     assert.equal(request.kind, "failure");
-    assert.equal(request.error.code, "REQUEST_HEADERS_TOO_LARGE");
+    assert.equal(request.error.code, "REQUEST_FIELDS_TOO_LARGE");
     assert.equal(requests, 0);
 
     const response = await responseClient.request(urlFor(server));
     assert.equal(response.kind, "failure");
-    assert.equal(response.error.code, "RESPONSE_HEADERS_TOO_LARGE");
+    assert.equal(response.error.code, "RESPONSE_FIELDS_TOO_LARGE");
   } finally {
     await requestClient.close();
     await responseClient.close();

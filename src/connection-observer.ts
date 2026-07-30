@@ -1,5 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { channel } from "node:diagnostics_channel";
+import {
+  channel,
+  type Channel,
+} from "node:diagnostics_channel";
 import type { Socket } from "node:net";
 import { TLSSocket } from "node:tls";
 import type {
@@ -15,158 +18,219 @@ interface Observation {
   readonly method: string;
   socket: Socket | null;
   requestBodyBytesSent: number;
-  statusMessage: string | null;
+  rawTrailers: readonly (string | Uint8Array)[];
+  readonly onRequestBodyProgress: (sentBytes: number) => void;
 }
 
 export interface ObservedRequest<T> {
   readonly value: T;
   readonly facts: ConnectionFacts;
   readonly requestBodyBytesSent: () => number;
-  readonly statusMessage: string | null;
+  readonly rawTrailers: () => readonly (string | Uint8Array)[];
 }
 
-const observations = new AsyncLocalStorage<Observation>();
-const requests = new WeakMap<object, Observation>();
-const pendingObservations = new Set<Observation>();
-const connectionDurations = new WeakMap<Socket, number>();
-const usedConnections = new WeakSet<Socket>();
-
-channel("undici:request:create").subscribe((message: unknown) => {
-  const request = objectProperty(message, "request");
-  const current = observations.getStore();
-  const observation =
-    current !== undefined && pendingObservations.has(current)
-      ? current
-      : request === null
-        ? undefined
-        : matchingObservation(request);
-  if (request !== null && observation !== undefined) {
-    requests.set(request, observation);
-    pendingObservations.delete(observation);
-  }
-});
-
-channel("undici:request:bodyChunkSent").subscribe((message: unknown) => {
-  const request = objectProperty(message, "request");
-  if (request === null) return;
-  const observation = requests.get(request);
-  if (observation === undefined) return;
-  const chunk = unknownProperty(message, "chunk");
-  if (typeof chunk === "string") {
-    observation.requestBodyBytesSent += Buffer.byteLength(chunk);
-  } else if (chunk instanceof Uint8Array) {
-    observation.requestBodyBytesSent += chunk.byteLength;
-  }
-});
-
-channel("undici:request:headers").subscribe((message: unknown) => {
-  const request = objectProperty(message, "request");
-  if (request === null) return;
-  const observation = requests.get(request);
-  if (observation === undefined) return;
-  const response = unknownProperty(message, "response");
-  const statusMessage = stringProperty(response, "statusText");
-  observation.statusMessage =
-    statusMessage === null || statusMessage.length === 0
-      ? null
-      : statusMessage;
-});
-
-channel("undici:client:sendHeaders").subscribe((message: unknown) => {
-  const request = objectProperty(message, "request");
-  const socket = objectProperty(message, "socket");
-  if (request === null || !isSocket(socket)) return;
-  const observation = requests.get(request);
-  if (observation !== undefined) observation.socket = socket;
-});
-
-export async function observeRequest<T>(
-  context: {
-    readonly origin: string;
-    readonly path: string;
-    readonly method: string;
-  },
-  operation: () => Promise<T>,
-): Promise<ObservedRequest<T>> {
-  const observation: Observation = {
-    ...context,
-    socket: null,
-    requestBodyBytesSent: 0,
-    statusMessage: null,
-  };
-  pendingObservations.add(observation);
-  let value: T;
-  try {
-    value = await observations.run(observation, operation);
-  } finally {
-    pendingObservations.delete(observation);
-  }
-  return {
-    value,
-    facts: factsFromSocket(observation.socket),
-    requestBodyBytesSent: () => observation.requestBodyBytesSent,
-    statusMessage: observation.statusMessage,
-  };
+interface Subscription {
+  readonly source: Channel;
+  readonly listener: (message: unknown) => void;
 }
 
-function matchingObservation(request: object): Observation | undefined {
-  const origin = unknownProperty(request, "origin");
-  const path = unknownProperty(request, "path");
-  const method = unknownProperty(request, "method");
-  const normalizedOrigin =
-    origin instanceof URL
-      ? origin.origin
-      : typeof origin === "string"
-        ? new URL(origin).origin
-        : null;
-  if (
-    normalizedOrigin === null ||
-    typeof path !== "string" ||
-    typeof method !== "string"
-  ) {
+export class UndiciConnectionObserver {
+  readonly #observations = new AsyncLocalStorage<Observation>();
+  readonly #requests = new WeakMap<object, Observation>();
+  readonly #pending = new Map<string, Observation[]>();
+  readonly #connectionDurations = new WeakMap<Socket, number>();
+  readonly #usedConnections = new WeakSet<Socket>();
+  readonly #subscriptions: readonly Subscription[];
+  #closed = false;
+
+  public constructor() {
+    this.#subscriptions = [
+      this.subscribe("undici:request:create", this.requestCreated),
+      this.subscribe(
+        "undici:request:bodyChunkSent",
+        this.requestBodyChunkSent,
+      ),
+      this.subscribe("undici:request:trailers", this.responseTrailersReceived),
+      this.subscribe("undici:client:sendHeaders", this.requestFieldsSent),
+    ];
+  }
+
+  public async observeRequest<T>(
+    context: {
+      readonly origin: string;
+      readonly path: string;
+      readonly method: string;
+    },
+    operation: () => Promise<T>,
+    onRequestBodyProgress: (sentBytes: number) => void,
+  ): Promise<ObservedRequest<T>> {
+    if (this.#closed) {
+      throw new Error("The transport observer is closed.");
+    }
+    const observation: Observation = {
+      ...context,
+      socket: null,
+      requestBodyBytesSent: 0,
+      rawTrailers: [],
+      onRequestBodyProgress,
+    };
+    const key = observationKey(context);
+    const queue = this.#pending.get(key) ?? [];
+    queue.push(observation);
+    this.#pending.set(key, queue);
+    let value: T;
+    try {
+      value = await this.#observations.run(observation, operation);
+    } finally {
+      this.removePending(key, observation);
+    }
+    return {
+      value,
+      facts: this.factsFromSocket(observation.socket),
+      requestBodyBytesSent: () => observation.requestBodyBytesSent,
+      rawTrailers: () => observation.rawTrailers,
+    };
+  }
+
+  public recordConnectionDuration(
+    socket: Socket,
+    durationMs: number,
+  ): void {
+    this.#connectionDurations.set(socket, durationMs);
+  }
+
+  public close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const { source, listener } of this.#subscriptions) {
+      source.unsubscribe(listener);
+    }
+    this.#observations.disable();
+  }
+
+  private readonly requestCreated = (message: unknown): void => {
+    const request = objectProperty(message, "request");
+    const current = this.#observations.getStore();
+    const observation =
+      current !== undefined && this.isPending(current)
+        ? current
+        : this.takeMatchingPending(request);
+    if (request !== null && observation !== undefined) {
+      this.#requests.set(request, observation);
+      this.removePending(observationKey(observation), observation);
+    }
+  };
+
+  private takeMatchingPending(request: object | null): Observation | undefined {
+    if (request === null) return undefined;
+    const context = requestObservationContext(request);
+    if (context === null) return undefined;
+    const exactKey = observationKey(context);
+    const exactQueue = this.#pending.get(exactKey);
+    const exact = exactQueue?.shift();
+    if (exactQueue?.length === 0) this.#pending.delete(exactKey);
+    if (exact !== undefined) return exact;
+    for (const [key, queue] of this.#pending) {
+      const index = queue.findIndex(
+        (observation) =>
+          observation.method === context.method &&
+          (observation.path === context.path ||
+            `${observation.origin}${observation.path}` === context.path),
+      );
+      if (index < 0) continue;
+      const [observation] = queue.splice(index, 1);
+      if (queue.length === 0) this.#pending.delete(key);
+      return observation;
+    }
     return undefined;
   }
-  return [...pendingObservations].find(
-    (observation) =>
-      observation.origin === normalizedOrigin &&
-      observation.path === path &&
-      observation.method === method,
-  );
-}
 
-export function recordConnectionDuration(
-  socket: Socket,
-  durationMs: number,
-): void {
-  connectionDurations.set(socket, durationMs);
-}
+  private removePending(key: string, observation: Observation): void {
+    const queue = this.#pending.get(key);
+    if (queue === undefined) return;
+    const index = queue.indexOf(observation);
+    if (index >= 0) queue.splice(index, 1);
+    if (queue.length === 0) this.#pending.delete(key);
+  }
 
-function factsFromSocket(socket: Socket | null): ConnectionFacts {
-  if (socket === null) {
+  private isPending(observation: Observation): boolean {
+    return (
+      this.#pending
+        .get(observationKey(observation))
+        ?.includes(observation) === true
+    );
+  }
+
+  private readonly requestBodyChunkSent = (message: unknown): void => {
+    const observation = this.observationFor(message);
+    if (observation === undefined) return;
+    const chunk = unknownProperty(message, "chunk");
+    if (typeof chunk === "string") {
+      observation.requestBodyBytesSent += Buffer.byteLength(chunk);
+    } else if (chunk instanceof Uint8Array) {
+      observation.requestBodyBytesSent += chunk.byteLength;
+    } else {
+      return;
+    }
+    observation.onRequestBodyProgress(observation.requestBodyBytesSent);
+  };
+
+  private readonly responseTrailersReceived = (message: unknown): void => {
+    const observation = this.observationFor(message);
+    if (observation === undefined) return;
+    const trailers = unknownProperty(message, "trailers");
+    if (isRawFields(trailers)) observation.rawTrailers = trailers.slice();
+  };
+
+  private readonly requestFieldsSent = (message: unknown): void => {
+    const observation = this.observationFor(message);
+    const socket = objectProperty(message, "socket");
+    if (observation !== undefined && isSocket(socket)) {
+      observation.socket = socket;
+    }
+  };
+
+  private subscribe(
+    name: string,
+    listener: (message: unknown) => void,
+  ): Subscription {
+    const source = channel(name);
+    source.subscribe(listener);
+    return { source, listener };
+  }
+
+  private observationFor(message: unknown): Observation | undefined {
+    const request = objectProperty(message, "request");
+    return request === null ? undefined : this.#requests.get(request);
+  }
+
+  private factsFromSocket(socket: Socket | null): ConnectionFacts {
+    if (socket === null) {
+      return {
+        socketRemoteAddress: null,
+        socketRemotePort: null,
+        socketAddressFamily: null,
+        establishmentMs: null,
+        connectionReused: null,
+        httpVersion: null,
+        tls: null,
+        proxyUrl: null,
+      };
+    }
+    const connectionReused = this.#usedConnections.has(socket);
+    this.#usedConnections.add(socket);
+    const tls = socket instanceof TLSSocket ? tlsFacts(socket) : null;
     return {
-      socketRemoteAddress: null,
-      socketRemotePort: null,
-      socketAddressFamily: null,
-      establishmentMs: null,
-      connectionReused: null,
-      httpVersion: null,
-      tls: null,
+      socketRemoteAddress: socket.remoteAddress ?? null,
+      socketRemotePort: socket.remotePort ?? null,
+      socketAddressFamily: addressFamily(socket.remoteFamily),
+      establishmentMs: this.#connectionDurations.get(socket) ?? null,
+      connectionReused,
+      httpVersion: negotiatedVersion(socket),
+      tls,
       proxyUrl: null,
     };
   }
-  const connectionReused = usedConnections.has(socket);
-  usedConnections.add(socket);
-  const tls = socket instanceof TLSSocket ? tlsFacts(socket) : null;
-  return {
-    socketRemoteAddress: socket.remoteAddress ?? null,
-    socketRemotePort: socket.remotePort ?? null,
-    socketAddressFamily: addressFamily(socket.remoteFamily),
-    establishmentMs: connectionDurations.get(socket) ?? null,
-    connectionReused,
-    httpVersion: negotiatedVersion(socket),
-    tls,
-    proxyUrl: null,
-  };
 }
 
 function negotiatedVersion(socket: Socket): HttpVersion {
@@ -243,9 +307,7 @@ function objectProperty(
 }
 
 function unknownProperty(value: unknown, name: string): unknown {
-  if (!hasUnknownProperty(value, name)) {
-    return null;
-  }
+  if (!hasUnknownProperty(value, name)) return null;
   return value[name];
 }
 
@@ -268,4 +330,47 @@ function isSocket(value: object | null): value is Socket {
     "destroy" in value &&
     typeof value.destroy === "function"
   );
+}
+
+function isRawFields(
+  value: unknown,
+): value is readonly (string | Uint8Array)[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) => typeof item === "string" || item instanceof Uint8Array,
+    )
+  );
+}
+
+function observationKey(context: {
+  readonly origin: string;
+  readonly path: string;
+  readonly method: string;
+}): string {
+  return `${context.method}\n${context.origin}\n${context.path}`;
+}
+
+function requestObservationContext(request: object): {
+  readonly origin: string;
+  readonly path: string;
+  readonly method: string;
+} | null {
+  const origin = unknownProperty(request, "origin");
+  const path = unknownProperty(request, "path");
+  const method = unknownProperty(request, "method");
+  const normalizedOrigin =
+    origin instanceof URL
+      ? origin.origin
+      : typeof origin === "string"
+        ? new URL(origin).origin
+        : null;
+  if (
+    normalizedOrigin === null ||
+    typeof path !== "string" ||
+    typeof method !== "string"
+  ) {
+    return null;
+  }
+  return { origin: normalizedOrigin, path, method };
 }
