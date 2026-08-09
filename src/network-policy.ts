@@ -121,27 +121,31 @@ export class NetworkSafetyPolicy {
     return resolution;
   }
 
-  public async decide(url: string): Promise<NetworkResolution["decision"]> {
+  public async decide(
+    url: string,
+    signal?: AbortSignal,
+  ): Promise<NetworkResolution["decision"]> {
+    signal?.throwIfAborted();
     let parsed: URL;
     try {
       parsed = new URL(url);
     } catch {
-      return {
+      return Object.freeze({
         allowed: false,
         reason: "Invalid URL",
         checkedIp: null,
         rejectionKind: "policy",
-      };
+      });
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return {
+      return Object.freeze({
         allowed: false,
         reason: `Unsupported protocol: ${parsed.protocol}`,
         checkedIp: null,
         rejectionKind: "policy",
-      };
+      });
     }
-    return (await this.resolveHostname(parsed.hostname)).decision;
+    return (await this.resolveHostname(parsed.hostname, signal)).decision;
   }
 
   private cacheResolution(

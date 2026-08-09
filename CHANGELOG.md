@@ -8,6 +8,8 @@
   cancellation, trailers, and transfer observations.
 - Add public-address network policy, DNS pinning, origin limits, explicit proxy
   support, and configurable TLS verification.
+- Expose the network-safety, field-merging, content-length, and redirect
+  composition primitives required by clients that own higher-level policy.
 - Keep private-network opt-in limited to private-use address space.
 - Create default response spool files securely in the system temporary
   directory without trusting a predictable shared child directory.

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { HttpConfigurationError } from "../dist/index.js";
+import {
+  HttpConfigurationError,
+  NetworkSafetyPolicy as PublicNetworkSafetyPolicy,
+} from "../dist/index.js";
 import { DEFAULT_NETWORK_SAFETY } from "../dist/defaults.js";
 import { decideIp } from "../dist/ip-policy.js";
 import {
@@ -132,6 +135,26 @@ test("bounds DNS resolution time", async () => {
   assert.equal(result.decision.allowed, false);
   assert.equal(result.decision.reason, "DNS lookup timed out");
   assert.equal(performance.now() - startedAt < 500, true);
+});
+
+test("exposes immutable, cancellable network-safety decisions", async () => {
+  assert.equal(PublicNetworkSafetyPolicy, NetworkSafetyPolicy);
+  const invalid = await new NetworkSafetyPolicy(DEFAULT_NETWORK_SAFETY).decide(
+    "not a URL",
+  );
+  assert.equal(invalid.allowed, false);
+  assert.equal(Object.isFrozen(invalid), true);
+
+  const controller = new AbortController();
+  const reason = new Error("cancelled");
+  const policy = new NetworkSafetyPolicy(
+    DEFAULT_NETWORK_SAFETY,
+    async () => await new Promise(() => {}),
+  );
+  const pending = policy.decide("https://pending.example/", controller.signal);
+  controller.abort(reason);
+  await assert.rejects(pending, reason);
+  policy.close();
 });
 
 test("preserves invalid resolver output as a contract error", async () => {

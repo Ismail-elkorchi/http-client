@@ -20,8 +20,14 @@ export {
   HttpClientError,
   HttpConfigurationError,
 } from "./errors.ts";
-export { HttpFields } from "./fields.ts";
+export { HttpFields, mergeHttpFields } from "./fields.ts";
+export { parseContentLength } from "./content-length.ts";
 export { defineHttpMethod } from "./method.ts";
+export { NetworkSafetyPolicy } from "./network-policy.ts";
+export {
+  requestAfterRedirect,
+  type RedirectedRequest,
+} from "./request-fields.ts";
 export type {
   BufferedHttpRequestOptions,
   BufferedHttpResponse,
@@ -62,7 +68,9 @@ export type {
   MultipartFileContent,
   MultipartPart,
   NetworkAddress,
+  NetworkResolution,
   NetworkResolver,
+  NetworkSafetyDecision,
   NetworkSafetyOptions,
   PeerCertificateFacts,
   ProtocolPreference,

@@ -163,6 +163,10 @@ const localClient = new NodeHttpClient({
 });
 ```
 
+Applications that evaluate targets before making a request can reuse the same
+policy semantics through `NetworkSafetyPolicy`. Its `decide()` operation
+accepts an optional abort signal.
+
 An explicit HTTP proxy resolves the target itself, so proxy use requires an
 explicit opt-out from target address pinning:
 
@@ -204,7 +208,9 @@ shutdown calls share one completion operation.
 The runtime entrypoint exports:
 
 - `NodeHttpClient`
-- `HttpFields`
+- `HttpFields` and `mergeHttpFields()`
+- `NetworkSafetyPolicy`
+- `parseContentLength()` and `requestAfterRedirect()`
 - `defineHttpMethod()`
 - `HttpClientError`, `HttpConfigurationError`, and `HttpClientStateError`
 - `collectResponseBody()`, `openResponseBodyFile()`, `readResponseBody()`,

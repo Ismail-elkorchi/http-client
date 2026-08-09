@@ -2,9 +2,15 @@ import {
   collectResponseBody,
   defineHttpMethod,
   HttpFields,
+  mergeHttpFields,
+  NetworkSafetyPolicy,
   NodeHttpClient,
+  parseContentLength,
+  requestAfterRedirect,
   type BufferedHttpResult,
+  type HttpMethod,
   type HttpRequestBody,
+  type NetworkSafetyDecision,
   type StreamingHttpResult,
 } from "../../dist/index.js";
 
@@ -64,6 +70,39 @@ const fields = new HttpFields([
 ]);
 const cookies: readonly string[] = fields.all("set-cookie");
 void cookies;
+const redirected = requestAfterRedirect(
+  "https://first.example/",
+  "https://second.example/",
+  303,
+  {
+    method: "POST",
+    fields: mergeHttpFields(fields, [
+      { name: "authorization", value: "Bearer token" },
+    ]),
+    body: { kind: "text", text: "payload" },
+  },
+);
+const redirectedMethod: HttpMethod = redirected.method;
+void redirectedMethod;
+const length: number | null = parseContentLength("42");
+void length;
+
+const policy = new NetworkSafetyPolicy({
+  enabled: true,
+  allowPrivateNetworks: false,
+  allowLocalhost: false,
+  mixedAddressPolicy: "reject-host",
+  dnsTimeoutMs: 5_000,
+  dnsCacheTtlMs: 60_000,
+  maxDnsCacheEntries: 128,
+  addressAttemptDelayMs: 250,
+});
+const safetyDecision: Promise<NetworkSafetyDecision> = policy.decide(
+  "https://example.com/",
+  AbortSignal.timeout(1_000),
+);
+void safetyDecision;
+policy.close();
 
 const collected = collectResponseBody(
   new ReadableStream<Uint8Array>(),

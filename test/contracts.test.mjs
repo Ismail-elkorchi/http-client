@@ -6,7 +6,10 @@ import {
   defineHttpMethod,
   HttpConfigurationError,
   HttpFields,
+  mergeHttpFields,
   NodeHttpClient,
+  parseContentLength,
+  requestAfterRedirect,
 } from "../dist/index.js";
 import {
   closeServer,
@@ -161,6 +164,35 @@ test("preserves ordered repeated field lines", async () => {
     await client.close();
     await closeServer(server);
   }
+});
+
+test("exposes strict field and redirect composition primitives", () => {
+  const fields = mergeHttpFields(
+    new HttpFields([
+      { name: "accept", value: "text/plain" },
+      { name: "authorization", value: "Bearer token" },
+    ]),
+    [{ name: "accept", value: "application/json" }],
+  );
+  assert.deepEqual(fields.lines(), [
+    { name: "authorization", value: "Bearer token" },
+    { name: "accept", value: "application/json" },
+  ]);
+  const redirected = requestAfterRedirect(
+    "https://first.example/",
+    "https://second.example/",
+    303,
+    {
+      method: "POST",
+      fields,
+      body: { kind: "text", text: "payload" },
+    },
+  );
+  assert.equal(redirected.method, "GET");
+  assert.equal(redirected.body, undefined);
+  assert.equal(redirected.fields.has("authorization"), false);
+  assert.equal(parseContentLength("42"), 42);
+  assert.equal(parseContentLength("4.2"), null);
 });
 
 test("contains asynchronous observer failures", async () => {
