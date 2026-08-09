@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
-import { HttpConfigurationError } from "./errors.js";
+import { isDenseArray } from "./arrays.ts";
+import { HttpConfigurationError } from "./errors.ts";
 import type {
   HttpRequestBody,
   MultipartFileContent,
   MultipartPart,
   RequestByteStream,
-} from "./types.js";
+} from "./types.ts";
 
 export type TransportRequestBody =
   | string
@@ -23,68 +24,123 @@ export function prepareRequestBody(
   body: HttpRequestBody | undefined,
   maxBytes: number,
 ): PreparedRequestBody {
-  if (body === undefined) {
+  const snapshot = snapshotRequestBody(body);
+  if (snapshot === undefined) {
     return {
       create: noRequestBody,
       contentLength: 0,
       contentType: null,
     };
   }
-  switch (body.kind) {
+  switch (snapshot.kind) {
     case "bytes": {
-      if (!(body.bytes instanceof Uint8Array)) {
-        throw new HttpConfigurationError(
-          "A bytes request body requires a Uint8Array.",
-        );
-      }
-      enforceKnownLength(body.bytes.byteLength, maxBytes);
+      enforceKnownLength(snapshot.bytes.byteLength, maxBytes);
       return {
-        create: () => body.bytes,
-        contentLength: body.bytes.byteLength,
+        create: () => snapshot.bytes,
+        contentLength: snapshot.bytes.byteLength,
         contentType: null,
       };
     }
     case "text": {
-      if (typeof body.text !== "string") {
-        throw new HttpConfigurationError(
-          "A text request body requires a string.",
-        );
-      }
-      const length = Buffer.byteLength(body.text);
+      const length = Buffer.byteLength(snapshot.text);
       enforceKnownLength(length, maxBytes);
       return {
-        create: () => body.text,
+        create: () => snapshot.text,
         contentLength: length,
         contentType: null,
       };
     }
     case "multipart": {
-      return prepareMultipartBody(body.parts, maxBytes);
+      return prepareMultipartBody(snapshot.parts, maxBytes);
     }
     case "stream": {
-      if (typeof body.create !== "function") {
-        throw new HttpConfigurationError(
-          "A stream request body requires a create function.",
-        );
-      }
-      validateOptionalLength(body.contentLength);
       if (
-        body.contentLength !== undefined &&
-        body.contentLength > maxBytes
+        snapshot.contentLength !== undefined &&
+        snapshot.contentLength > maxBytes
       ) {
         throw new RequestBodyLimitError(maxBytes);
       }
       return {
         create: () =>
           createStreamBodyFromFactory(
-            body.create,
+            snapshot.create,
             maxBytes,
-            body.contentLength ?? null,
+            snapshot.contentLength ?? null,
           ),
-        contentLength: body.contentLength ?? null,
+        contentLength: snapshot.contentLength ?? null,
         contentType: null,
       };
     }
+  }
+}
+
+export function snapshotRequestBody(
+  body: HttpRequestBody | undefined,
+): HttpRequestBody | undefined {
+  if (
+    body === undefined ||
+    typeof body !== "object" ||
+    body === null ||
+    !("kind" in body)
+  ) {
+    if (body === undefined) return undefined;
+    throw new HttpConfigurationError(
+      "body must be a discriminated request body.",
+    );
+  }
+  switch (body.kind) {
+    case "bytes":
+      if (
+        !hasOnlyKeys(body, ["kind", "bytes"]) ||
+        !(body.bytes instanceof Uint8Array)
+      ) {
+        throw new HttpConfigurationError(
+          "A bytes request body requires only a Uint8Array.",
+        );
+      }
+      return Object.freeze({ kind: "bytes", bytes: body.bytes.slice() });
+    case "text":
+      if (
+        !hasOnlyKeys(body, ["kind", "text"]) ||
+        typeof body.text !== "string"
+      ) {
+        throw new HttpConfigurationError(
+          "A text request body requires only a string.",
+        );
+      }
+      return Object.freeze({ kind: "text", text: body.text });
+    case "multipart":
+      if (
+        !hasOnlyKeys(body, ["kind", "parts"]) ||
+        !isMultipartParts(body.parts)
+      ) {
+        throw new HttpConfigurationError(
+          "A multipart request body contains an invalid part.",
+        );
+      }
+      return Object.freeze({
+        kind: "multipart",
+        parts: Object.freeze(body.parts.map(snapshotMultipartPart)),
+      });
+    case "stream":
+      if (
+        !hasOnlyKeys(body, ["kind", "create", "contentLength"]) ||
+        typeof body.create !== "function"
+      ) {
+        throw new HttpConfigurationError(
+          "A stream request body requires a create function.",
+        );
+      }
+      validateOptionalLength(body.contentLength);
+      return Object.freeze({
+        kind: "stream",
+        create: body.create,
+        ...(body.contentLength === undefined
+          ? {}
+          : { contentLength: body.contentLength }),
+      });
+    default:
+      throw new HttpConfigurationError("body.kind is invalid.");
   }
 }
 
@@ -92,12 +148,6 @@ function prepareMultipartBody(
   parts: readonly MultipartPart[],
   maxBytes: number,
 ): PreparedRequestBody {
-  const candidate: unknown = parts;
-  if (!isMultipartParts(candidate)) {
-    throw new HttpConfigurationError(
-      "A multipart request body contains an invalid part.",
-    );
-  }
   const boundary = `http-client-${randomUUID()}`;
   const segments: MultipartSegment[] = [];
   let contentLength = 0;
@@ -106,7 +156,7 @@ function prepareMultipartBody(
     enforceKnownLength(contentLength, maxBytes);
     segments.push(segment);
   };
-  for (const part of candidate) {
+  for (const part of parts) {
     const disposition =
       `Content-Disposition: form-data; name="${quotedParameter(part.name)}"`;
     append(byteSegment(textBytes(`--${boundary}\r\n`)));
@@ -160,6 +210,33 @@ function fileContentSegment(content: MultipartFileContent): MultipartSegment {
       };
 }
 
+function snapshotMultipartPart(part: MultipartPart): MultipartPart {
+  if (part.kind === "text") {
+    return Object.freeze({
+      kind: "text",
+      name: part.name,
+      value: part.value,
+    });
+  }
+  const content: MultipartFileContent = part.content.kind === "bytes"
+    ? Object.freeze({
+        kind: "bytes",
+        bytes: part.content.bytes.slice(),
+      })
+    : Object.freeze({
+        kind: "stream",
+        contentLength: part.content.contentLength,
+        create: part.content.create,
+      });
+  return Object.freeze({
+    kind: "file",
+    name: part.name,
+    fileName: part.fileName,
+    ...(part.mediaType === undefined ? {} : { mediaType: part.mediaType }),
+    content,
+  });
+}
+
 function segmentLength(segment: MultipartSegment): number {
   return segment.kind === "bytes"
     ? segment.bytes.byteLength
@@ -183,7 +260,11 @@ async function* iterateMultipartSegments(
 }
 
 function isMultipartParts(value: unknown): value is readonly MultipartPart[] {
-  return Array.isArray(value) && value.every(isMultipartPart);
+  return (
+    Array.isArray(value) &&
+    isDenseArray(value) &&
+    value.every(isMultipartPart)
+  );
 }
 
 function isMultipartPart(value: unknown): value is MultipartPart {

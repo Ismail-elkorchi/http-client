@@ -1,3 +1,4 @@
+import { isDenseArray } from "./arrays.ts";
 import {
   DEFAULT_HTTP_CLIENT_OPTIONS,
   DEFAULT_HTTP_TIMEOUTS,
@@ -5,13 +6,11 @@ import {
   DEFAULT_RESPONSE_STORAGE,
   DEFAULT_RESPONSE_TRANSFER_LIMITS,
   DEFAULT_TLS_OPTIONS,
-} from "./defaults.js";
-import { HttpConfigurationError } from "./errors.js";
-import {
-  HttpFields,
-  httpFieldsToRecord,
-} from "./fields.js";
-import { validateHttpMethod } from "./method.js";
+} from "./defaults.ts";
+import { HttpConfigurationError } from "./errors.ts";
+import { HttpFields } from "./fields.ts";
+import { validateHttpMethod } from "./method.ts";
+import { snapshotRequestBody } from "./request-body.ts";
 import type {
   BufferedHttpRequestOptions,
   HttpClientConfiguration,
@@ -31,7 +30,7 @@ import type {
   ResponseTransferLimits,
   TlsMaterial,
   TlsOptions,
-} from "./types.js";
+} from "./types.ts";
 
 const PROTOCOL_PREFERENCES = new Set<ProtocolPreference>([
   "auto",
@@ -66,7 +65,7 @@ export interface ResolvedRequestOptions {
           readonly statusCode: number;
           readonly hopIndex: number;
         },
-      ) => Promise<RedirectDecision> | RedirectDecision)
+      ) => PromiseLike<RedirectDecision> | RedirectDecision)
     | undefined;
 }
 
@@ -227,9 +226,9 @@ export function resolveRequestOptions(
       "CONNECT requires a tunnel API and cannot be used as a request method.",
     );
   }
-  validateRequestBody(options.body);
+  const body = snapshotRequestBody(options.body);
   if (
-    options.body !== undefined &&
+    body !== undefined &&
     (method === "GET" || method === "HEAD" || method === "TRACE")
   ) {
     throw new HttpConfigurationError(
@@ -275,7 +274,7 @@ export function resolveRequestOptions(
   return {
     method,
     fields: new HttpFields(options.fields),
-    body: options.body,
+    body,
     signal: options.signal,
     timeouts: resolveRequestTimeouts(options.timeouts, client.timeouts),
     responseTransferLimits: resolveTransferLimits(
@@ -581,7 +580,26 @@ function resolveTls(
       "tls.serverName cannot contain spaces or control characters.",
     );
   }
-  return value;
+  return {
+    ...value,
+    ...(value.certificateAuthorities === undefined
+      ? {}
+      : {
+          certificateAuthorities: snapshotTlsMaterial(
+            value.certificateAuthorities,
+          ),
+        }),
+    ...(value.clientCertificate === undefined
+      ? {}
+      : {
+          clientCertificate: snapshotTlsMaterial(value.clientCertificate),
+        }),
+    ...(value.clientPrivateKey === undefined
+      ? {}
+      : {
+          clientPrivateKey: snapshotTlsMaterial(value.clientPrivateKey),
+        }),
+  };
 }
 
 function resolveProxy(
@@ -616,7 +634,7 @@ function resolveProxy(
     );
   }
   const fields = new HttpFields(configuration.fields);
-  httpFieldsToRecord(fields);
+  assertUniqueFieldNames(fields, "Proxy fields");
   if (
     (url.username !== "" || url.password !== "") &&
     fields.has("proxy-authorization")
@@ -630,46 +648,6 @@ function resolveProxy(
     fields,
     tls: resolveTls(configuration.tls),
   };
-}
-
-function validateRequestBody(value: HttpRequestBody | undefined): void {
-  if (value === undefined) return;
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("kind" in value) ||
-    typeof value.kind !== "string"
-  ) {
-    throw new HttpConfigurationError(
-      "body must be a discriminated request body.",
-    );
-  }
-  if (
-    value.kind !== "bytes" &&
-    value.kind !== "text" &&
-    value.kind !== "multipart" &&
-    value.kind !== "stream"
-  ) {
-    throw new HttpConfigurationError("body.kind is invalid.");
-  }
-  switch (value.kind) {
-    case "bytes":
-      assertKnownKeys(value, ["kind", "bytes"], "bytes request body");
-      break;
-    case "text":
-      assertKnownKeys(value, ["kind", "text"], "text request body");
-      break;
-    case "multipart":
-      assertKnownKeys(value, ["kind", "parts"], "multipart request body");
-      break;
-    case "stream":
-      assertKnownKeys(
-        value,
-        ["kind", "create", "contentLength"],
-        "stream request body",
-      );
-      break;
-  }
 }
 
 function validateSignal(value: AbortSignal | undefined): void {
@@ -715,6 +693,7 @@ function validateTlsMaterial(
   const items = Array.isArray(value) ? value : [value];
   if (
     items.length === 0 ||
+    !isDenseArray(items) ||
     items.some(
       (item) =>
         !(
@@ -726,6 +705,29 @@ function validateTlsMaterial(
     throw new HttpConfigurationError(
       `${name} must contain non-empty strings or byte arrays.`,
     );
+  }
+}
+
+function snapshotTlsMaterial(value: TlsMaterial): TlsMaterial {
+  if (typeof value === "string") return value;
+  if (value instanceof Uint8Array) return value.slice();
+  return Object.freeze(
+    value.map((item) =>
+      typeof item === "string" ? item : item.slice(),
+    ),
+  );
+}
+
+function assertUniqueFieldNames(fields: HttpFields, name: string): void {
+  const observed = new Set<string>();
+  for (const field of fields) {
+    const normalized = field.name.toLowerCase();
+    if (observed.has(normalized)) {
+      throw new HttpConfigurationError(
+        `${name} cannot repeat ${field.name}.`,
+      );
+    }
+    observed.add(normalized);
   }
 }
 

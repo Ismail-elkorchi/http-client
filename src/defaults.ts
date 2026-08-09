@@ -5,8 +5,8 @@ import type {
   ResponseStorageOptions,
   ResponseTransferLimits,
   TlsOptions,
-} from "./types.js";
-import { HttpFields } from "./fields.js";
+} from "./types.ts";
+import { HttpFields } from "./fields.ts";
 
 export const DEFAULT_NETWORK_SAFETY: NetworkSafetyOptions = Object.freeze({
   enabled: true,

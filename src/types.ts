@@ -1,7 +1,7 @@
 import type { SecureVersion } from "node:tls";
-import type { RESPONSE_BODY_BRAND } from "./body-brand.js";
-import type { HttpClientError } from "./errors.js";
-import type { HttpFields } from "./fields.js";
+import type { RESPONSE_BODY_BRAND } from "./body-brand.ts";
+import type { HttpClientError } from "./errors.ts";
+import type { HttpFields } from "./fields.ts";
 
 declare const EXTENSION_HTTP_METHOD: unique symbol;
 
@@ -140,7 +140,9 @@ export interface ProxyConfiguration {
 }
 
 export interface HttpClientObserver {
-  onEvent(event: HttpClientEvent): void;
+  readonly onEvent: (
+    event: HttpClientEvent,
+  ) => void | PromiseLike<void>;
 }
 
 export interface HttpClientOptions {
@@ -237,10 +239,12 @@ export interface HttpSessionResponseContext extends HttpAttemptContext {
 }
 
 export interface HttpSessionAdapter {
-  prepareRequest(
+  readonly prepareRequest: (
     context: HttpSessionRequestContext,
-  ): Promise<HttpFieldsInput | undefined>;
-  acceptResponse(context: HttpSessionResponseContext): Promise<void>;
+  ) => HttpFieldsInput | PromiseLike<HttpFieldsInput | undefined> | undefined;
+  readonly acceptResponse: (
+    context: HttpSessionResponseContext,
+  ) => void | PromiseLike<void>;
 }
 
 export type RedirectDecision =
@@ -269,7 +273,7 @@ interface HttpRequestOptionsBase {
   ) => void;
   readonly onRedirect?: (
     context: RedirectContext,
-  ) => Promise<RedirectDecision> | RedirectDecision;
+  ) => PromiseLike<RedirectDecision> | RedirectDecision;
 }
 
 type BodylessRequestOptions =

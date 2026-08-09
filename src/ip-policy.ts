@@ -1,9 +1,9 @@
 import { isIP } from "node:net";
-import { HttpConfigurationError } from "./errors.js";
+import { HttpConfigurationError } from "./errors.ts";
 import type {
   NetworkSafetyDecision,
   NetworkSafetyOptions,
-} from "./types.js";
+} from "./types.ts";
 
 const PUBLIC_V4_EXCEPTIONS: readonly CidrV4[] = [
   cidr4("192.0.0.9", 32),
@@ -30,7 +30,6 @@ const BLOCKED_V4: readonly CidrV4[] = [
 
 const PRIVATE_V4: readonly CidrV4[] = [
   cidr4("10.0.0.0", 8),
-  cidr4("100.64.0.0", 10),
   cidr4("172.16.0.0", 12),
   cidr4("192.168.0.0", 16),
 ];

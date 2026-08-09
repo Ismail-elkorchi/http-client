@@ -1,4 +1,4 @@
-import type { HttpErrorCode } from "./types.js";
+import type { HttpErrorCode } from "./types.ts";
 
 export class HttpConfigurationError extends TypeError {
   public override readonly name = "HttpConfigurationError";

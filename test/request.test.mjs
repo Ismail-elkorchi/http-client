@@ -471,6 +471,7 @@ test("rejects invalid request boundaries before network activity", async () => {
   const client = new NodeHttpClient({
     networkSafety: { allowLocalhost: true },
   });
+  let sessionPreparationCount = 0;
   try {
     await assert.rejects(
       client.request("http://127.0.0.1/", { method: "get" }),
@@ -533,8 +534,115 @@ test("rejects invalid request boundaries before network activity", async () => {
       }),
       HttpConfigurationError,
     );
+    await assert.rejects(
+      client.request("http://127.0.0.1/", {
+        method: "POST",
+        body: { kind: "text", text: 42 },
+        session: {
+          prepareRequest() {
+            sessionPreparationCount += 1;
+          },
+          acceptResponse() {},
+        },
+      }),
+      HttpConfigurationError,
+    );
+    const sparseParts = new Array(1);
+    await assert.rejects(
+      client.request("http://127.0.0.1/", {
+        method: "POST",
+        body: { kind: "multipart", parts: sparseParts },
+      }),
+      HttpConfigurationError,
+    );
+    assert.equal(sessionPreparationCount, 0);
   } finally {
     await client.close();
+  }
+});
+
+test("snapshots byte request bodies before asynchronous session work", async () => {
+  let received = null;
+  const server = await listen(
+    http.createServer((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        received = Buffer.concat(chunks);
+        response.end();
+      });
+    }),
+  );
+  const bytes = new Uint8Array([1, 2, 3]);
+  let continueSession;
+  const sessionWaiting = Promise.withResolvers();
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+  });
+  try {
+    const operation = client.requestBuffered(urlFor(server), {
+      method: "POST",
+      body: { kind: "bytes", bytes },
+      session: {
+        async prepareRequest() {
+          const gate = Promise.withResolvers();
+          continueSession = gate.resolve;
+          sessionWaiting.resolve();
+          await gate.promise;
+        },
+        acceptResponse() {},
+      },
+    });
+    await sessionWaiting.promise;
+    bytes[0] = 9;
+    continueSession();
+    const result = await operation;
+    assert.equal(result.kind, "response");
+    assert.deepEqual(received, Buffer.from([1, 2, 3]));
+  } finally {
+    await client.close();
+    await closeServer(server);
+  }
+});
+
+test("replays the initial byte snapshot across redirects", async () => {
+  const received = [];
+  let mutateBody;
+  const firstBodyReceived = Promise.withResolvers();
+  const server = await listen(
+    http.createServer((request, response) => {
+      const chunks = [];
+      request.on("data", (chunk) => chunks.push(chunk));
+      request.on("end", () => {
+        received.push(Buffer.concat(chunks));
+        if (request.url === "/first") {
+          mutateBody();
+          firstBodyReceived.resolve();
+          response.writeHead(307, { location: "/second" });
+        }
+        response.end();
+      });
+    }),
+  );
+  const bytes = new Uint8Array([1, 2, 3]);
+  mutateBody = () => {
+    bytes[0] = 9;
+  };
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+  });
+  try {
+    const operation = client.fetchBuffered(`${urlFor(server)}first`, {
+      method: "POST",
+      body: { kind: "bytes", bytes },
+    });
+    await firstBodyReceived.promise;
+    const result = await operation;
+    assert.equal(result.kind, "response");
+    assert.deepEqual(received, [Buffer.from([1, 2, 3]), Buffer.from([1, 2, 3])]);
+  } finally {
+    await client.close();
+    await closeServer(server);
   }
 });
 

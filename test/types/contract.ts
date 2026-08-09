@@ -89,6 +89,15 @@ void new NodeHttpClient({
 );
 
 void new NodeHttpClient().request("https://example.com/", {
+  session: {
+    prepareRequest() {
+      return [{ name: "authorization", value: "Bearer token" }];
+    },
+    acceptResponse() {},
+  },
+});
+
+void new NodeHttpClient().request("https://example.com/", {
   // @ts-expect-error Extension methods must pass through defineHttpMethod.
   method: "PROPFIND",
 });

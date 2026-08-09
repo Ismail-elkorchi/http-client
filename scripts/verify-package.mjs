@@ -6,19 +6,26 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
+const repositoryRoot = path.resolve(import.meta.dirname, "..");
 const npmCli = process.env.npm_execpath;
 const npmEnvironment = {
   ...process.env,
+  npm_config_audit: "false",
   npm_config_dry_run: "false",
+  npm_config_fund: "false",
+  npm_config_offline: "true",
+  npm_config_update_notifier: "false",
 };
 
 if (npmCli === undefined || npmCli.length === 0) {
   throw new Error("npm_execpath is required to verify the package.");
 }
 
-const directory = await fs.mkdtemp(
+const temporaryDirectory = await fs.mkdtemp(
   path.join(os.tmpdir(), "http-client-consumer-"),
 );
+const packageDirectory = path.join(temporaryDirectory, "packages");
+const consumerDirectory = path.join(temporaryDirectory, "consumer");
 const server = http.createServer((_request, response) => {
   response.writeHead(207, "Verified Package", {
     "content-type": "text/plain",
@@ -27,6 +34,8 @@ const server = http.createServer((_request, response) => {
 });
 
 try {
+  await fs.mkdir(packageDirectory);
+  await fs.mkdir(consumerDirectory);
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -39,41 +48,175 @@ try {
     throw new Error("The package verification server did not bind to TCP.");
   }
 
+  const packageArchive = await pack(repositoryRoot, packageDirectory);
+  const undiciArchive = await pack(
+    path.join(repositoryRoot, "node_modules", "undici"),
+    packageDirectory,
+  );
+  const nodeTypesArchive = await pack(
+    path.join(repositoryRoot, "node_modules", "@types", "node"),
+    packageDirectory,
+  );
+  const undiciTypesArchive = await pack(
+    path.join(repositoryRoot, "node_modules", "undici-types"),
+    packageDirectory,
+  );
+  verifyInventory(packageArchive.files);
+
+  await fs.writeFile(
+    path.join(consumerDirectory, "package.json"),
+    `${JSON.stringify({
+      private: true,
+      type: "module",
+      dependencies: {
+        "@ismail-elkorchi/http-client": `file:../packages/${packageArchive.fileName}`,
+        undici: `file:../packages/${undiciArchive.fileName}`,
+      },
+      devDependencies: {
+        "@types/node": `file:../packages/${nodeTypesArchive.fileName}`,
+        "undici-types": `file:../packages/${undiciTypesArchive.fileName}`,
+      },
+    }, null, 2)}\n`,
+  );
+  await fs.writeFile(
+    path.join(consumerDirectory, "verify.mjs"),
+    consumerSource(),
+  );
+  await fs.writeFile(
+    path.join(consumerDirectory, "verify-types.ts"),
+    typeConsumerSource(),
+  );
+  await fs.writeFile(
+    path.join(consumerDirectory, "tsconfig.json"),
+    `${JSON.stringify({
+      compilerOptions: {
+        target: "ES2024",
+        module: "NodeNext",
+        moduleResolution: "NodeNext",
+        types: ["node"],
+        strict: true,
+        exactOptionalPropertyTypes: true,
+        noUncheckedIndexedAccess: true,
+        noEmit: true,
+        skipLibCheck: false,
+      },
+      include: ["verify-types.ts"],
+    }, null, 2)}\n`,
+  );
+
+  await execute(
+    process.execPath,
+    [
+      npmCli,
+      "install",
+      "--ignore-scripts",
+      "--no-package-lock",
+    ],
+    { cwd: consumerDirectory, env: npmEnvironment },
+  );
+
+  await execute(
+    process.execPath,
+    [
+      path.join(repositoryRoot, "node_modules", "typescript", "bin", "tsc"),
+      "--project",
+      path.join(consumerDirectory, "tsconfig.json"),
+    ],
+    { cwd: consumerDirectory },
+  );
+
+  const consumerPath = path.join(consumerDirectory, "verify.mjs");
+  const runtimeEnvironment = {
+    ...process.env,
+    HTTP_CLIENT_TEST_URL: `http://127.0.0.1:${String(address.port)}/`,
+  };
+  await execute(process.execPath, [consumerPath, "Node.js"], {
+    cwd: consumerDirectory,
+    env: runtimeEnvironment,
+  });
+  await execute(
+    "deno",
+    [
+      "run",
+      "--cached-only",
+      "--node-modules-dir=manual",
+      "--allow-env",
+      "--allow-net=127.0.0.1",
+      "--allow-read",
+      "--allow-sys",
+      consumerPath,
+      "Deno",
+    ],
+    {
+      cwd: consumerDirectory,
+      env: { ...runtimeEnvironment, DENO_NO_UPDATE_CHECK: "1" },
+    },
+  );
+  process.stdout.write("packed consumers passed: Node.js, Deno\n");
+} finally {
+  await new Promise((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections();
+  });
+  await fs.rm(temporaryDirectory, { recursive: true, force: true });
+}
+
+async function pack(source, destination) {
   const packed = await execute(
     process.execPath,
     [
       npmCli,
       "pack",
+      source,
       "--ignore-scripts",
       "--json",
       "--pack-destination",
-      directory,
+      destination,
     ],
     {
+      cwd: repositoryRoot,
       env: npmEnvironment,
       maxBuffer: 10 * 1024 * 1024,
     },
   );
   const inventory = JSON.parse(packed.stdout);
-  const fileName = inventory[0]?.filename;
-  if (typeof fileName !== "string") {
+  const archive = inventory[0];
+  if (
+    typeof archive !== "object" ||
+    archive === null ||
+    typeof archive.filename !== "string" ||
+    !Array.isArray(archive.files)
+  ) {
     throw new Error("npm pack did not report a package archive.");
   }
-  const consumerDirectory = path.join(directory, "consumer");
-  await fs.mkdir(consumerDirectory);
-  await fs.writeFile(
-    path.join(consumerDirectory, "package.json"),
-    JSON.stringify({
-      private: true,
-      type: "module",
-      dependencies: {
-        "@ismail-elkorchi/http-client": `file:../${fileName}`,
-      },
-    }),
-  );
-  await fs.writeFile(
-    path.join(consumerDirectory, "verify.mjs"),
-    `
+  return {
+    fileName: archive.filename,
+    files: archive.files,
+  };
+}
+
+function verifyInventory(files) {
+  const paths = new Set(files.map((file) => file.path));
+  for (const required of [
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "dist/index.d.ts",
+    "dist/index.js",
+    "package.json",
+  ]) {
+    if (!paths.has(required)) {
+      throw new Error(`Packed package is missing ${required}.`);
+    }
+  }
+  if ([...paths].some((filePath) => filePath.startsWith("src/"))) {
+    throw new Error("The npm package contains unpublished TypeScript sources.");
+  }
+}
+
+function consumerSource() {
+  return `
 import assert from "node:assert/strict";
 import {
   NodeHttpClient,
@@ -81,6 +224,7 @@ import {
   readResponseBody,
 } from "@ismail-elkorchi/http-client";
 
+const runtime = process.argv[2];
 const client = new NodeHttpClient({
   networkSafety: { allowLocalhost: true },
 });
@@ -94,42 +238,32 @@ try {
     "installed package",
   );
   await disposeResponseBody(result.body);
+  console.log(runtime + " packed consumer passed");
 } finally {
   await client.close();
 }
-`,
-  );
-  await execute(
-    process.execPath,
-    [
-      npmCli,
-      "install",
-      "--ignore-scripts",
-      "--no-audit",
-      "--no-fund",
-      "--no-package-lock",
-    ],
-    {
-      cwd: consumerDirectory,
-      env: npmEnvironment,
+`;
+}
+
+function typeConsumerSource() {
+  return `
+import {
+  NodeHttpClient,
+  type HttpClientEvent,
+  type StreamingHttpResult,
+} from "@ismail-elkorchi/http-client";
+
+const client = new NodeHttpClient({
+  observer: {
+    async onEvent(event: HttpClientEvent) {
+      void event.kind;
     },
-  );
-  await execute(
-    process.execPath,
-    [path.join(consumerDirectory, "verify.mjs")],
-    {
-      cwd: consumerDirectory,
-      env: {
-        ...process.env,
-        HTTP_CLIENT_TEST_URL:
-          `http://127.0.0.1:${String(address.port)}/`,
-      },
-    },
-  );
-} finally {
-  await new Promise((resolve) => {
-    server.close(() => resolve());
-    server.closeAllConnections();
-  });
-  await fs.rm(directory, { recursive: true, force: true });
+  },
+});
+
+const result: Promise<StreamingHttpResult> = client.request(
+  "https://example.com/",
+);
+void result;
+`;
 }

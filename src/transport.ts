@@ -16,15 +16,16 @@ import {
 } from "undici";
 import {
   UndiciConnectionObserver,
-} from "./connection-observer.js";
+} from "./connection-observer.ts";
 import {
   httpFieldsFromRaw,
   httpFieldsToFlatArray,
   httpFieldsToRecord,
-} from "./fields.js";
-import type { HttpFields } from "./fields.js";
-import type { NetworkSafetyPolicy } from "./network-policy.js";
-import type { TransportRequestBody } from "./request-body.js";
+} from "./fields.ts";
+import { isDenseArray } from "./arrays.ts";
+import type { HttpFields } from "./fields.ts";
+import type { NetworkSafetyPolicy } from "./network-policy.ts";
+import type { TransportRequestBody } from "./request-body.ts";
 import type {
   ConnectionFacts,
   HttpClientOptions,
@@ -32,7 +33,7 @@ import type {
   NetworkResolution,
   TlsMaterial,
   TlsOptions,
-} from "./types.js";
+} from "./types.ts";
 
 export interface TransportRequestOptions {
   readonly method: HttpMethod;
@@ -611,6 +612,7 @@ function strictHttp2Connector(
 function rawResponseFields(value: unknown): HttpFields {
   if (
     !Array.isArray(value) ||
+    !isDenseArray(value) ||
     !value.every(
       (item) => typeof item === "string" || item instanceof Uint8Array,
     )

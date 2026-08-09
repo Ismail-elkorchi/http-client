@@ -2,26 +2,26 @@ import { errors as undiciErrors } from "undici";
 import {
   ResponseFieldsTimeoutError,
   TotalTimeoutError,
-} from "./deadlines.js";
-import { HttpClientError } from "./errors.js";
-import { HttpFields } from "./fields.js";
-import { RequestFieldsLimitError } from "./request-fields.js";
+} from "./deadlines.ts";
+import { HttpClientError } from "./errors.ts";
+import { HttpFields } from "./fields.ts";
+import { RequestFieldsLimitError } from "./request-fields.ts";
 import {
   RequestBodyLengthError,
   RequestBodyLimitError,
   RequestBodySourceError,
-} from "./request-body.js";
+} from "./request-body.ts";
 import {
   ResponseBodyProgressTimeoutError,
   ResponseByteLimitError,
   UnsupportedContentEncodingError,
-} from "./response-stream.js";
+} from "./response-stream.ts";
 import {
   NetworkSafetyError,
   OriginCapacityError,
   ProtocolMismatchError,
   TransportClosedError,
-} from "./transport.js";
+} from "./transport.ts";
 import type {
   HttpAttemptContext,
   HttpAttemptResponseHead,
@@ -32,7 +32,7 @@ import type {
   HttpFailure,
   HttpRedirect,
   StreamingHttpResponse,
-} from "./types.js";
+} from "./types.ts";
 
 export function classifyError(
   caught: unknown,

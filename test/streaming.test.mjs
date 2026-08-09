@@ -43,6 +43,10 @@ test("returns response fields before the network body reaches EOF", async () => 
     const startedAt = performance.now();
     const result = await client.request(urlFor(server));
     assert.equal(result.kind, "response");
+    assert.equal(Object.isFrozen(result), true);
+    assert.throws(() => {
+      result.cancel = () => {};
+    }, TypeError);
     assert.equal(performance.now() - startedAt < 500, true);
     const reader = result.body.getReader();
     const first = await reader.read();
@@ -86,10 +90,15 @@ test("adopts persistent files and collects bounded response streams", async () =
   );
   const persistentFile = path.join(directory, "persistent.body");
   await fs.writeFile(persistentFile, "persistent");
+  if (process.platform !== "win32") await fs.chmod(directory, 0o755);
   try {
     const persistent = await openResponseBodyFile(persistentFile);
     assert.equal(persistent.kind, "file");
     assert.equal(persistent.temporary, false);
+    assert.equal(Object.isFrozen(persistent), true);
+    assert.throws(() => {
+      persistent.temporary = true;
+    }, TypeError);
     assert.equal(
       new TextDecoder().decode(await readResponseBody(persistent)),
       "persistent",
@@ -113,6 +122,14 @@ test("adopts persistent files and collects bounded response streams", async () =
       },
     );
     assert.equal(collected.kind, "file");
+    assert.equal(Object.isFrozen(collected), true);
+    assert.throws(() => {
+      collected.path = persistentFile;
+    }, TypeError);
+    if (process.platform !== "win32") {
+      const directoryMode = (await fs.stat(directory)).mode & 0o777;
+      assert.equal(directoryMode, 0o755);
+    }
     assert.equal(
       new TextDecoder().decode(await readResponseBody(collected)),
       "collected",
@@ -244,6 +261,30 @@ test("spools buffered responses into private disposable files", async () => {
     await client.close();
     await closeServer(server);
     await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("creates default spool files directly in the system temporary directory", async () => {
+  const server = await listen(
+    http.createServer((_request, response) => response.end("spooled")),
+  );
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+    responseStorage: { memoryThresholdBytes: 0 },
+  });
+  try {
+    const result = await client.requestBuffered(urlFor(server));
+    assert.equal(result.kind, "response");
+    assert.equal(result.body.kind, "file");
+    assert.equal(path.dirname(result.body.path), os.tmpdir());
+    assert.match(path.basename(result.body.path), /^http-client-\d+-/u);
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(result.body.path)).mode & 0o777, 0o600);
+    }
+    await disposeResponseBody(result.body);
+  } finally {
+    await client.close();
+    await closeServer(server);
   }
 });
 

@@ -1,40 +1,40 @@
-import { bufferResult } from "./buffered-response.js";
+import { bufferResult } from "./buffered-response.ts";
 import {
   resolveClientOptions,
   resolveRequestOptions,
   validateRedirectDecision,
   type ResolvedRequestOptions,
-} from "./configuration.js";
+} from "./configuration.ts";
 import {
   HttpConfigurationError,
   type HttpClientError,
-} from "./errors.js";
+} from "./errors.ts";
 import {
   awaitWithSignal,
   PhaseDeadline,
   RequestDeadline,
   ResponseFieldsTimeoutError,
-} from "./deadlines.js";
-import { mergeHttpFields } from "./fields.js";
+} from "./deadlines.ts";
+import { mergeHttpFields } from "./fields.ts";
 import {
   applyContentLength,
   enforceRequestFieldsLimit,
   requestAfterRedirect,
   type RedirectedRequest,
-} from "./request-fields.js";
-import { NetworkSafetyPolicy } from "./network-policy.js";
-import { emitHttpClientEvent } from "./observer.js";
+} from "./request-fields.ts";
+import { NetworkSafetyPolicy } from "./network-policy.ts";
+import { emitHttpClientEvent } from "./observer.ts";
 import {
   prepareRequestBody,
   RequestBodyLimitError,
-} from "./request-body.js";
+} from "./request-body.ts";
 import {
   classifyError,
   clientError,
   failureResult,
-} from "./outcomes.js";
-import { createStreamingBody } from "./response-stream.js";
-import { UndiciTransport } from "./transport.js";
+} from "./outcomes.ts";
+import { createStreamingBody } from "./response-stream.ts";
+import { UndiciTransport } from "./transport.ts";
 import type {
   BufferedHttpRequestOptions,
   BufferedHttpResult,
@@ -49,7 +49,7 @@ import type {
   HttpResponseCompletion,
   StreamingHttpResponse,
   StreamingHttpResult,
-} from "./types.js";
+} from "./types.ts";
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
@@ -439,33 +439,6 @@ export class NodeHttpClient {
       );
     }
 
-    let sessionFields;
-    try {
-      sessionFields =
-        options.session === undefined
-          ? undefined
-          : await awaitWithSignal(
-              options.session.prepareRequest({
-                ...context,
-                fields: request.fields,
-              }),
-              signal,
-            );
-    } catch (caught) {
-      return this.failure(
-        context,
-        signal.aborted
-          ? classifyError(caught, url.href, signal, false)
-          : clientError(
-              "NETWORK_FAILURE",
-              "Session state could not prepare the request.",
-              url.href,
-              caught,
-            ),
-        options,
-      );
-    }
-
     let preparedBody;
     try {
       preparedBody = prepareRequestBody(
@@ -486,6 +459,34 @@ export class NodeHttpClient {
         );
       }
       throw caught;
+    }
+    let sessionFields;
+    try {
+      sessionFields =
+        options.session === undefined
+          ? undefined
+          : await awaitWithSignal(
+              Promise.resolve(
+                options.session.prepareRequest({
+                  ...context,
+                  fields: request.fields,
+                }),
+              ),
+              signal,
+            );
+    } catch (caught) {
+      return this.failure(
+        context,
+        signal.aborted
+          ? classifyError(caught, url.href, signal, false)
+          : clientError(
+              "NETWORK_FAILURE",
+              "Session state could not prepare the request.",
+              url.href,
+              caught,
+            ),
+        options,
+      );
     }
     const mergedFields = mergeHttpFields(request.fields, sessionFields);
     const decodingFields =
@@ -596,12 +597,14 @@ export class NodeHttpClient {
     try {
       if (options.session !== undefined) {
         await awaitWithSignal(
-          options.session.acceptResponse({
-            ...context,
-            statusCode: response.statusCode,
-            statusMessage: response.statusMessage,
-            fields: response.fields,
-          }),
+          Promise.resolve(
+            options.session.acceptResponse({
+              ...context,
+              statusCode: response.statusCode,
+              statusMessage: response.statusMessage,
+              fields: response.fields,
+            }),
+          ),
           signal,
         );
       }
@@ -704,12 +707,13 @@ export class NodeHttpClient {
     response: StreamingHttpResponse,
     deadline: RequestDeadline,
   ): StreamingHttpResponse {
-    this.activeResponses.add(response);
-    void response.completion.then(() => {
-      this.activeResponses.delete(response);
+    const protectedResponse = Object.freeze(response);
+    this.activeResponses.add(protectedResponse);
+    void protectedResponse.completion.then(() => {
+      this.activeResponses.delete(protectedResponse);
       this.releaseDeadline(deadline);
     });
-    return response;
+    return protectedResponse;
   }
 
   private async finishShutdown(operation: Promise<void>): Promise<void> {

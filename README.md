@@ -1,16 +1,24 @@
 # HTTP Client
 
-A streaming HTTP/1.1 and HTTP/2 client for Node.js 24 or newer.
+A strict streaming HTTP/1.1 and HTTP/2 client with bounded transfers,
+address-pinned DNS resolution, explicit outcomes, redirects, content decoding,
+proxy and TLS configuration, and memory-to-file response storage.
 
-It provides bounded uploads and responses, redirects, content decoding,
-lossless HTTP field lines, address-pinned DNS resolution, explicit proxy and
-TLS configuration, temporary file storage, cancellation, trailers, connection
-facts, and attempt-level transfer results.
+The package targets Node.js 24 or newer. Its installed package is also tested
+through Deno 2.9's Node compatibility layer.
 
 ## Install
 
+From npm:
+
 ```sh
 npm install @ismail-elkorchi/http-client
+```
+
+From JSR:
+
+```ts
+import { NodeHttpClient } from "jsr:@ismail-elkorchi/http-client@^0.1.0";
 ```
 
 ## Stream a response
@@ -40,12 +48,14 @@ try {
 }
 ```
 
-`request()` performs one exchange. `fetch()` follows redirects. Both return
-after the response field section arrives and keep the total deadline active until the
-body completes or is cancelled.
+`request()` performs one exchange. `fetch()` follows redirects. Both resolve
+when the response field section arrives, while `completion` reports the final
+body transfer outcome. Consume or cancel every streaming response body so its
+connection and deadline can be released.
 
-Every response body must be consumed or cancelled. `destroy()` cancels all
-active responses when graceful shutdown is not appropriate.
+Invalid definitions and request shapes reject with `HttpConfigurationError`.
+Network, protocol, timeout, transfer-limit, and cancellation failures use the
+`failure` result with a stable `HttpClientError.code`.
 
 ## Buffer a response
 
@@ -78,16 +88,17 @@ try {
 }
 ```
 
-Responses larger than `memoryThresholdBytes` are stored in private temporary
-files. Wire and decoded byte limits apply before storage.
+Responses larger than `memoryThresholdBytes` are written to private files.
+Dispose buffered response bodies after use. `openResponseBodyFile()` adopts an
+existing file without granting disposal permission to delete it, while
+`collectResponseBody()` stores a byte stream under an explicit limit and
+storage policy.
 
-`openResponseBodyFile()` safely adopts a persistent cache file without giving
-disposal permission to delete it. `collectResponseBody()` turns a byte stream
-into a branded response body with an explicit byte limit and storage policy.
+## Send request bodies
 
-## Send a request body
-
-Request bodies are discriminated and replayable across redirects:
+Text, byte, stream, and multipart bodies are replayable across redirects.
+Stream factories are invoked only after network admission and must return a
+fresh `ReadableStream<Uint8Array>` or `AsyncIterable<Uint8Array>` each time.
 
 ```ts
 await client.fetch("https://example.com/upload", {
@@ -106,9 +117,7 @@ await client.fetch("https://example.com/upload", {
 });
 ```
 
-The other body kinds are `text`, `bytes`, and `multipart`.
-
-Extension methods must be defined explicitly:
+Extension methods are explicit:
 
 ```ts
 import { defineHttpMethod } from "@ismail-elkorchi/http-client";
@@ -120,8 +129,9 @@ await client.request("https://example.com/resource", {
 
 ## HTTP fields
 
-Requests accept ordered field lines and responses return an immutable
-`HttpFields` value. Repeated lines, including `set-cookie`, remain separate.
+Requests accept ordered field lines and responses expose an immutable
+`HttpFields` collection. Repeated lines, including `set-cookie`, remain
+separate.
 
 ```ts
 const result = await client.request("https://example.com/", {
@@ -136,28 +146,16 @@ if (result.kind === "response") {
 }
 ```
 
-`first()`, `all()`, `has()`, and iteration are lossless operations.
-`toHeaders()` is available when a caller explicitly accepts the Web
-`Headers` model. Field values use the transport's Latin-1 byte model; values
-outside that range are rejected before network activity.
+Use `first()`, `all()`, `has()`, `lines()`, or iteration without losing field
+line order. `toHeaders()` is available when the Web `Headers` representation
+is appropriate. Request field values use the transport's Latin-1 byte model.
 
-## Timeouts and observation
+## Network safety, proxies, and TLS
 
-Set `timeouts.totalMs` or `timeouts.responseBodyProgressMs` to `null` to
-disable that deadline. The response-body progress deadline applies while a
-consumer is waiting for the next body chunk and is suspended while the
-consumer applies backpressure. Connect and response-field deadlines remain
-active.
-
-An observer receives discriminated attempt, request-body, response, and
-response-body progress events. Observer failures never alter the request.
-Session adapters can prepare fields and accept response state with the request
-identifier, attempt index, method, URL, and complete field lines.
-
-## Network boundaries
-
-Public addresses are permitted by default. Local, private, reserved,
-documentation, and mixed public/non-public DNS answers are rejected.
+Public addresses are allowed by default. Local, private, special-purpose, and
+mixed public/non-public DNS results are rejected. A custom resolver is
+validated and its approved addresses are snapshotted before connection
+pinning.
 
 ```ts
 const localClient = new NodeHttpClient({
@@ -165,9 +163,8 @@ const localClient = new NodeHttpClient({
 });
 ```
 
-An HTTP proxy resolves and connects to the target on behalf of the client, so
-target address pinning cannot be guaranteed. Proxy configuration therefore
-requires `networkSafety.enabled` to be `false`.
+An explicit HTTP proxy resolves the target itself, so proxy use requires an
+explicit opt-out from target address pinning:
 
 ```ts
 const proxyClient = new NodeHttpClient({
@@ -176,20 +173,55 @@ const proxyClient = new NodeHttpClient({
 });
 ```
 
-`protocolPreference: "http2"` is strict: only TLS origins are accepted, and a
-connection is rejected before request bytes are written unless ALPN selects
-HTTP/2. Strict HTTP/2 requests share one multiplexed connection per origin;
-`maxConnectionsPerOrigin` applies to HTTP/1.1 and automatic protocol
-negotiation. Strict HTTP/2 is not accepted with a proxy because that
-negotiation cannot be verified before the tunneled request.
+`protocolPreference: "http2"` requires a TLS origin and verified HTTP/2 ALPN
+negotiation before request bytes are sent. TLS certificate authorities, client
+certificates, protocol versions, ciphers, and server names are configurable.
 
-Retry policy, cookies, caches, rate limits, and application sessions belong in
-consumer adapters.
+## Limits, deadlines, and observation
+
+Client and request configuration controls request body bytes, request and
+response field bytes, wire response bytes, decoded response bytes, content
+encoding layers, redirects, retained origins, and connections per origin.
+
+Set `timeouts.totalMs` or `timeouts.responseBodyProgressMs` to `null` to
+disable that deadline. The body-progress deadline runs while a consumer waits
+for a chunk and pauses while the consumer applies backpressure. Connect and
+response-field deadlines remain bounded.
+
+Observers receive discriminated attempt, upload, response, and download
+events. Synchronous and asynchronous observer failures are contained. Session
+adapters can synchronously or asynchronously prepare request fields and accept
+response state for cookies, authentication, tracing, and application policy.
+
+## Lifecycle
+
+`close()` stops new work and drains accepted exchanges. `destroy()` aborts
+active deadlines and response bodies before closing the transport. Concurrent
+shutdown calls share one completion operation.
+
+## Public API
+
+The runtime entrypoint exports:
+
+- `NodeHttpClient`
+- `HttpFields`
+- `defineHttpMethod()`
+- `HttpClientError`, `HttpConfigurationError`, and `HttpClientStateError`
+- `collectResponseBody()`, `openResponseBodyFile()`, `readResponseBody()`,
+  `responseBodyPrefix()`, `responseBodySize()`, `responseBodyStream()`, and
+  `disposeResponseBody()`
+- `ResponseBodyCollectionLimitError`
+
+The same entrypoint exports the TypeScript definitions for configuration,
+requests, bodies, observations, transfers, failures, and response outcomes.
 
 ## Development
 
 ```sh
 npm ci
 npm run check
-npm test
 ```
+
+The check runs strict TypeScript, lint, runtime and public-type tests,
+offline packed-package consumers for Node.js and Deno, and the JSR publication
+dry run.

@@ -2,14 +2,14 @@ import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { BodyCollector } from "./body-collector.js";
-import { RESPONSE_BODY_BRAND } from "./body-brand.js";
-import { HttpConfigurationError } from "./errors.js";
+import { BodyCollector } from "./body-collector.ts";
+import { RESPONSE_BODY_BRAND } from "./body-brand.ts";
+import { HttpConfigurationError } from "./errors.ts";
 import type {
   ResponseBody,
   ResponseBodyCollectionOptions,
   ResponseStorageOptions,
-} from "./types.js";
+} from "./types.ts";
 
 export function responseBodySize(body: ResponseBody | null): number {
   if (body !== null) validateResponseBody(body);
@@ -80,13 +80,14 @@ export async function openResponseBodyFile(
       "Response body file path must identify a regular file.",
     );
   }
-  return {
+  const body: ResponseBody = {
     [RESPONSE_BODY_BRAND]: true,
     kind: "file",
     path: filePath,
     size: metadata.size,
     temporary: false,
   };
+  return Object.freeze(body);
 }
 
 export async function collectResponseBody(

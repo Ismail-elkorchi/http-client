@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   defineHttpMethod,
   HttpConfigurationError,
+  HttpFields,
   NodeHttpClient,
 } from "../dist/index.js";
 import {
@@ -115,6 +116,10 @@ test("enforces declared lengths for Web request streams", async () => {
 });
 
 test("preserves ordered repeated field lines", async () => {
+  assert.throws(
+    () => new HttpFields(new Array(1)),
+    HttpConfigurationError,
+  );
   let requestFields = [];
   const server = await listen(
     http.createServer((request, response) => {
@@ -152,6 +157,28 @@ test("preserves ordered repeated field lines", async () => {
     );
     assert.notEqual(latin1Index, -1);
     assert.equal(requestFields[latin1Index + 1], "caf\u00e9");
+  } finally {
+    await client.close();
+    await closeServer(server);
+  }
+});
+
+test("contains asynchronous observer failures", async () => {
+  const server = await listen(
+    http.createServer((_request, response) => response.end("complete")),
+  );
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+    observer: {
+      onEvent() {
+        return Promise.reject(new Error("observer failed"));
+      },
+    },
+  });
+  try {
+    const result = await client.requestBuffered(urlFor(server));
+    assert.equal(result.kind, "response");
+    await new Promise((resolve) => setImmediate(resolve));
   } finally {
     await client.close();
     await closeServer(server);

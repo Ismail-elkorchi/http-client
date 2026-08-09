@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { HttpConfigurationError } from "../dist/index.js";
+import { DEFAULT_NETWORK_SAFETY } from "../dist/defaults.js";
+import { decideIp } from "../dist/ip-policy.js";
 import {
-  DEFAULT_NETWORK_SAFETY,
-  HttpConfigurationError,
-  NetworkSafetyPolicy,
-  decideIp,
   evaluateNetworkAddresses,
-} from "../dist/index.js";
+  NetworkSafetyPolicy,
+} from "../dist/network-policy.js";
 
 test("classifies current IANA IPv4 special-purpose ranges", () => {
   const expected = new Map([
@@ -45,6 +45,19 @@ test("classifies current IANA IPv6 special-purpose ranges", () => {
   ]);
   for (const [address, allowed] of expected) {
     assert.equal(decideIp(address, DEFAULT_NETWORK_SAFETY).allowed, allowed);
+  }
+});
+
+test("limits private-network opt-in to private-use address space", () => {
+  const options = {
+    ...DEFAULT_NETWORK_SAFETY,
+    allowPrivateNetworks: true,
+  };
+  for (const address of ["10.0.0.1", "172.16.0.1", "192.168.0.1", "fc00::1"]) {
+    assert.equal(decideIp(address, options).allowed, true);
+  }
+  for (const address of ["100.64.0.1", "169.254.0.1", "fe80::1"]) {
+    assert.equal(decideIp(address, options).allowed, false);
   }
 });
 
@@ -132,7 +145,7 @@ test("preserves invalid resolver output as a contract error", async () => {
   );
 });
 
-test("rejects invalid address inventories at the public boundary", () => {
+test("rejects invalid address inventories at the network-policy boundary", () => {
   assert.throws(() =>
     evaluateNetworkAddresses(
       "invalid.example",
@@ -140,6 +153,29 @@ test("rejects invalid address inventories at the public boundary", () => {
       DEFAULT_NETWORK_SAFETY,
     ),
   );
+  assert.throws(() =>
+    evaluateNetworkAddresses(
+      "sparse.example",
+      new Array(1),
+      DEFAULT_NETWORK_SAFETY,
+    ),
+  );
+});
+
+test("snapshots approved resolver addresses before pinning", () => {
+  const address = { address: "8.8.8.8", family: 4 };
+  const resolution = evaluateNetworkAddresses(
+    "mutable.example",
+    [address],
+    DEFAULT_NETWORK_SAFETY,
+  );
+  address.address = "127.0.0.1";
+  assert.deepEqual(resolution.addresses, [
+    { address: "8.8.8.8", family: 4 },
+  ]);
+  assert.equal(Object.isFrozen(resolution), true);
+  assert.equal(Object.isFrozen(resolution.addresses), true);
+  assert.equal(Object.isFrozen(resolution.addresses[0]), true);
 });
 
 test("coalesces concurrent DNS lookups", async () => {

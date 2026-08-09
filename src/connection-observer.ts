@@ -5,12 +5,13 @@ import {
 } from "node:diagnostics_channel";
 import type { Socket } from "node:net";
 import { TLSSocket } from "node:tls";
+import { isDenseArray } from "./arrays.ts";
 import type {
   ConnectionFacts,
   HttpVersion,
   PeerCertificateFacts,
   TlsFacts,
-} from "./types.js";
+} from "./types.ts";
 
 interface Observation {
   readonly origin: string;
@@ -381,6 +382,7 @@ function isRawFields(
 ): value is readonly (string | Uint8Array)[] {
   return (
     Array.isArray(value) &&
+    isDenseArray(value) &&
     value.every(
       (item) => typeof item === "string" || item instanceof Uint8Array,
     )

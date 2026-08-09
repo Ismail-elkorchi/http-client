@@ -3,9 +3,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Writable } from "node:stream";
-import { RESPONSE_BODY_BRAND } from "./body-brand.js";
-import { ensurePrivateDirectory, openPrivateFile } from "./private-files.js";
-import type { ResponseBody } from "./types.js";
+import { RESPONSE_BODY_BRAND } from "./body-brand.ts";
+import { ensureStorageDirectory, openPrivateFile } from "./private-files.ts";
+import type {
+  FileResponseBody,
+  MemoryResponseBody,
+  ResponseBody,
+} from "./types.ts";
 
 export class BodyCollector extends Writable {
   public bytesRead = 0;
@@ -21,8 +25,7 @@ export class BodyCollector extends Writable {
   ) {
     super();
     this.memoryThresholdBytes = memoryThresholdBytes;
-    this.directory =
-      spoolDirectory ?? path.join(os.tmpdir(), "http-client-bodies");
+    this.directory = spoolDirectory ?? os.tmpdir();
   }
 
   public override _write(
@@ -80,21 +83,23 @@ export class BodyCollector extends Writable {
 
   public body(): ResponseBody {
     if (this.filePath !== null) {
-      return {
+      const body: FileResponseBody = {
         [RESPONSE_BODY_BRAND]: true,
         kind: "file",
         path: this.filePath,
         size: this.bytesRead,
         temporary: true,
       };
+      return Object.freeze(body);
     }
     const bytes = Buffer.concat(this.chunks, this.bytesRead);
-    return {
+    const body: MemoryResponseBody = {
       [RESPONSE_BODY_BRAND]: true,
       kind: "memory",
       bytes,
       size: bytes.byteLength,
     };
+    return Object.freeze(body);
   }
 
   private async writeChunk(chunk: Buffer): Promise<void> {
@@ -116,10 +121,10 @@ export class BodyCollector extends Writable {
 
   private async ensureFile(): Promise<fs.FileHandle> {
     if (this.fileHandle !== null) return this.fileHandle;
-    await ensurePrivateDirectory(this.directory);
+    await ensureStorageDirectory(this.directory);
     this.filePath = path.join(
       this.directory,
-      `${process.pid}-${randomUUID()}.body`,
+      `http-client-${process.pid}-${randomUUID()}.body`,
     );
     this.fileHandle = await openPrivateFile(this.filePath);
     for (const chunk of this.chunks) await writeAll(this.fileHandle, chunk);

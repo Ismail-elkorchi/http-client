@@ -1,5 +1,5 @@
-import { HttpConfigurationError } from "./errors.js";
-import type { ExtensionHttpMethod, HttpMethod } from "./types.js";
+import { HttpConfigurationError } from "./errors.ts";
+import type { ExtensionHttpMethod, HttpMethod } from "./types.ts";
 
 const METHOD_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Z]+$/u;
 const STANDARD_METHODS = new Set([

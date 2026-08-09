@@ -1,3 +1,10 @@
+/**
+ * Strict streaming HTTP/1.1 and HTTP/2 requests with bounded transfers,
+ * explicit outcomes, and address-pinned network safety.
+ *
+ * @module
+ */
+
 export {
   collectResponseBody,
   disposeResponseBody,
@@ -7,33 +14,14 @@ export {
   responseBodyPrefix,
   responseBodySize,
   responseBodyStream,
-} from "./body.js";
-export { HttpClientStateError, NodeHttpClient } from "./client.js";
+} from "./body.ts";
+export { HttpClientStateError, NodeHttpClient } from "./client.ts";
 export {
   HttpClientError,
   HttpConfigurationError,
-} from "./errors.js";
-export { HttpFields } from "./fields.js";
-export { mergeHttpFields } from "./fields.js";
-export { parseContentLength } from "./content-length.js";
-export { defineHttpMethod } from "./method.js";
-export {
-  requestAfterRedirect,
-  type RedirectedRequest,
-} from "./request-fields.js";
-export {
-  DEFAULT_HTTP_CLIENT_OPTIONS,
-  DEFAULT_HTTP_TIMEOUTS,
-  DEFAULT_NETWORK_SAFETY,
-  DEFAULT_RESPONSE_STORAGE,
-  DEFAULT_RESPONSE_TRANSFER_LIMITS,
-  DEFAULT_TLS_OPTIONS,
-} from "./defaults.js";
-export { decideIp } from "./ip-policy.js";
-export {
-  evaluateNetworkAddresses,
-  NetworkSafetyPolicy,
-} from "./network-policy.js";
+} from "./errors.ts";
+export { HttpFields } from "./fields.ts";
+export { defineHttpMethod } from "./method.ts";
 export type {
   BufferedHttpRequestOptions,
   BufferedHttpResponse,
@@ -49,7 +37,6 @@ export type {
   HttpClientConfiguration,
   HttpClientEvent,
   HttpClientObserver,
-  HttpClientOptions,
   HttpCompletedAttempt,
   HttpErrorCode,
   HttpFailedAttempt,
@@ -76,13 +63,10 @@ export type {
   MultipartPart,
   NetworkAddress,
   NetworkResolver,
-  NetworkResolution,
-  NetworkSafetyDecision,
   NetworkSafetyOptions,
   PeerCertificateFacts,
   ProtocolPreference,
   ProxyConfiguration,
-  ProxyOptions,
   RedirectContext,
   RedirectDecision,
   RequestByteStream,
@@ -100,4 +84,4 @@ export type {
   TlsFacts,
   TlsMaterial,
   TlsOptions,
-} from "./types.js";
+} from "./types.ts";

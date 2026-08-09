@@ -1,7 +1,7 @@
 {
   "name": "@ismail-elkorchi/http-client",
   "version": "0.1.0",
-  "description": "Strict streaming HTTP client for Node.js.",
+  "description": "Strict streaming HTTP/1.1 and HTTP/2 client with bounded transfers and network safety.",
   "type": "module",
   "sideEffects": false,
   "license": "MIT",
@@ -9,6 +9,28 @@
     "type": "git",
     "url": "git+https://github.com/Ismail-elkorchi/http-client.git"
   },
+  "homepage": "https://github.com/Ismail-elkorchi/http-client",
+  "bugs": "https://github.com/Ismail-elkorchi/http-client/issues",
+  "author": {
+    "name": "Ismail El Korchi",
+    "email": "ismail.elkorchi@gmail.com",
+    "url": "https://ismailelkorchi.com"
+  },
+  "keywords": [
+    "http",
+    "http-client",
+    "http2",
+    "streaming",
+    "request",
+    "undici",
+    "ssrf",
+    "network-security",
+    "proxy",
+    "tls",
+    "typescript",
+    "nodejs",
+    "deno"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -18,28 +40,32 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "node scripts/clean.mjs && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:public": "tsc -p test/types/tsconfig.json",
     "lint": "eslint \"src/**/*.ts\"",
-    "check": "npm run typecheck && npm run lint",
-    "test": "npm run build && node --test test/*.test.mjs && tsc -p test/types/tsconfig.json && node scripts/verify-package.mjs",
-    "prepack": "npm run check && npm test"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:package": "node scripts/verify-package.mjs",
+    "check:jsr": "deno publish --dry-run --allow-dirty",
+    "check": "npm run lint && npm run test && npm run typecheck:public && npm run test:package && npm run check:jsr",
+    "prepack": "npm run build"
   },
   "dependencies": {
-    "undici": "8.9.0"
+    "undici": "^8.10.0"
   },
   "devDependencies": {
-    "@types/node": "24.10.1",
-    "eslint": "10.8.0",
-    "typescript": "6.0.3",
-    "typescript-eslint": "8.65.0"
+    "@types/node": "^24.13.3",
+    "eslint": "^10.8.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.66.0"
   },
   "engines": {
-    "node": ">=24.0.0",
-    "npm": ">=11.0.0"
+    "node": ">=24.0.0"
   },
   "publishConfig": {
     "access": "public",

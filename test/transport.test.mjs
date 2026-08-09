@@ -467,6 +467,28 @@ test("validates proxy and TLS configurations", () => {
       }),
     HttpConfigurationError,
   );
+  const sparseAuthorities = new Array(1);
+  assert.throws(
+    () =>
+      new NodeHttpClient({
+        tls: { certificateAuthorities: sparseAuthorities },
+      }),
+    HttpConfigurationError,
+  );
+});
+
+test("accepts prototype-named proxy fields without object collisions", async () => {
+  const client = new NodeHttpClient({
+    networkSafety: { enabled: false },
+    proxy: {
+      url: "http://proxy.example/",
+      fields: [
+        { name: "constructor", value: "value" },
+        { name: "__proto__", value: "value" },
+      ],
+    },
+  });
+  await client.close();
 });
 
 test("applies the total deadline while DNS is unresolved", async () => {

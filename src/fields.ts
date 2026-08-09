@@ -1,9 +1,10 @@
-import { HttpConfigurationError } from "./errors.js";
+import { HttpConfigurationError } from "./errors.ts";
+import { isDenseArray } from "./arrays.ts";
 import type {
   HttpField,
   HttpFieldInput,
   HttpFieldsInput,
-} from "./types.js";
+} from "./types.ts";
 
 const FIELD_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u;
 
@@ -11,9 +12,9 @@ export class HttpFields implements Iterable<HttpField> {
   readonly #lines: readonly HttpField[];
 
   public constructor(input: HttpFieldsInput = []) {
-    if (!Array.isArray(input)) {
+    if (!Array.isArray(input) || !isDenseArray(input)) {
       throw new HttpConfigurationError(
-        "HTTP fields must be an array of name and value objects.",
+        "HTTP fields must be a dense array of name and value objects.",
       );
     }
     this.#lines = Object.freeze(input.map(validateAndCopyField));
@@ -130,17 +131,9 @@ export function httpFieldsToFlatArray(
 export function httpFieldsToRecord(
   fields: HttpFields,
 ): Readonly<Record<string, string>> {
-  const record: Record<string, string> = {};
-  for (const { name, value } of fields) {
-    const normalized = name.toLowerCase();
-    if (record[normalized] !== undefined) {
-      throw new HttpConfigurationError(
-        `Proxy field ${name} cannot be repeated.`,
-      );
-    }
-    record[normalized] = value;
-  }
-  return record;
+  return Object.fromEntries(
+    fields.lines().map(({ name, value }) => [name.toLowerCase(), value]),
+  );
 }
 
 function validateAndCopyField(value: HttpFieldInput): HttpField {

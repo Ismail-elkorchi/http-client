@@ -1,19 +1,19 @@
-import { BodyStorageError } from "./body-collector.js";
+import { BodyStorageError } from "./body-collector.ts";
 import {
   disposeResponseBody,
   storeResponseBody,
-} from "./body.js";
-import type { ResolvedRequestOptions } from "./configuration.js";
-import { HttpClientError } from "./errors.js";
+} from "./body.ts";
+import type { ResolvedRequestOptions } from "./configuration.ts";
+import { HttpClientError } from "./errors.ts";
 import {
   clientError,
   failureFromResponse,
-} from "./outcomes.js";
+} from "./outcomes.ts";
 import type {
   BufferedHttpResponse,
   BufferedHttpResult,
   StreamingHttpResult,
-} from "./types.js";
+} from "./types.ts";
 
 export async function bufferResult(
   result: StreamingHttpResult,

@@ -10,8 +10,8 @@ import {
   createInflate,
   createZstdDecompress,
 } from "node:zlib";
-import type { HttpClientError } from "./errors.js";
-import { emitHttpClientEvent } from "./observer.js";
+import type { HttpClientError } from "./errors.ts";
+import { emitHttpClientEvent } from "./observer.ts";
 import type {
   HttpAttemptContext,
   HttpAttemptResponseHead,
@@ -19,7 +19,7 @@ import type {
   HttpClientObserver,
   HttpResponseCompletion,
   ResponseTransferLimits,
-} from "./types.js";
+} from "./types.ts";
 
 export interface StreamingBody {
   readonly body: ReadableStream<Uint8Array>;
@@ -39,7 +39,7 @@ export interface StreamingBodyOptions {
   readonly observer: HttpClientObserver | undefined;
   readonly onCompletion: (attempt: HttpResponseCompletion) => void;
   readonly requestBodyBytesSent: () => number;
-  readonly trailers: () => import("./fields.js").HttpFields;
+  readonly trailers: () => import("./fields.ts").HttpFields;
   readonly classifyFailure: (
     caught: unknown,
     decoding: boolean,

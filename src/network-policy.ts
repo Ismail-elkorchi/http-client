@@ -1,14 +1,15 @@
 import dns from "node:dns/promises";
 import { isIP } from "node:net";
-import { awaitWithSignal } from "./deadlines.js";
-import { HttpConfigurationError } from "./errors.js";
-import { decideIp } from "./ip-policy.js";
+import { isDenseArray } from "./arrays.ts";
+import { awaitWithSignal } from "./deadlines.ts";
+import { HttpConfigurationError } from "./errors.ts";
+import { decideIp } from "./ip-policy.ts";
 import type {
   NetworkAddress,
   NetworkResolution,
   NetworkResolver,
   NetworkSafetyOptions,
-} from "./types.js";
+} from "./types.ts";
 
 export class NetworkSafetyPolicy {
   private readonly options: NetworkSafetyOptions;
@@ -188,17 +189,17 @@ export function evaluateNetworkAddresses(
     );
   }
   if (!options.enabled) {
-    return {
-      decision: {
+    return Object.freeze({
+      decision: Object.freeze({
         allowed: true,
         reason: null,
         checkedIp: normalized[0]?.address ?? null,
         rejectionKind: null,
-      },
+      }),
       hostname,
       addresses: normalized,
-      rejectedAddresses: [],
-    };
+      rejectedAddresses: Object.freeze([]),
+    });
   }
 
   const approved: NetworkAddress[] = [];
@@ -228,17 +229,17 @@ export function evaluateNetworkAddresses(
       rejectedAddresses,
     );
   }
-  return {
-    decision: {
+  return Object.freeze({
+    decision: Object.freeze({
       allowed: true,
       reason: null,
       checkedIp: approved[0]?.address ?? null,
       rejectionKind: null,
-    },
+    }),
     hostname,
-    addresses: approved,
-    rejectedAddresses,
-  };
+    addresses: Object.freeze(approved),
+    rejectedAddresses: Object.freeze(rejectedAddresses),
+  });
 }
 
 function rejected(
@@ -248,17 +249,17 @@ function rejected(
   addresses: readonly NetworkAddress[],
   rejectedAddresses: readonly NetworkAddress[],
 ): NetworkResolution {
-  return {
-    decision: {
+  return Object.freeze({
+    decision: Object.freeze({
       allowed: false,
       reason,
       checkedIp: rejectedAddresses[0]?.address ?? null,
       rejectionKind,
-    },
+    }),
     hostname,
-    addresses,
-    rejectedAddresses,
-  };
+    addresses: Object.freeze([...addresses]),
+    rejectedAddresses: Object.freeze([...rejectedAddresses]),
+  });
 }
 
 function deduplicateAddresses(
@@ -276,9 +277,12 @@ function deduplicateAddresses(
     const key = `${String(address.family)}:${address.address}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    result.push(address);
+    result.push(Object.freeze({
+      address: address.address,
+      family: address.family,
+    }));
   }
-  return result;
+  return Object.freeze(result);
 }
 
 function normalizeHostname(hostname: string): string {
@@ -418,7 +422,11 @@ function validateResolvedAddresses(
 function isNetworkAddressArray(
   value: unknown,
 ): value is readonly NetworkAddress[] {
-  return Array.isArray(value) && value.every(isNetworkAddress);
+  return (
+    Array.isArray(value) &&
+    isDenseArray(value) &&
+    value.every(isNetworkAddress)
+  );
 }
 
 function isNetworkAddress(value: unknown): value is NetworkAddress {

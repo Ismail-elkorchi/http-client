@@ -1,11 +1,11 @@
-import { HttpConfigurationError } from "./errors.js";
+import { HttpConfigurationError } from "./errors.ts";
 import {
   mergeHttpFields,
   removeHttpFields,
-} from "./fields.js";
-import type { HttpFields } from "./fields.js";
-import { parseContentLength } from "./content-length.js";
-import type { HttpMethod, HttpRequestBody } from "./types.js";
+} from "./fields.ts";
+import type { HttpFields } from "./fields.ts";
+import { parseContentLength } from "./content-length.ts";
+import type { HttpMethod, HttpRequestBody } from "./types.ts";
 
 const SENSITIVE_FIELDS = new Set([
   "authorization",
