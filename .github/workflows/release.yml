@@ -1,124 +1,226 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to validate without publishing"
+        required: true
+        default: main
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.ref }}
   cancel-in-progress: false
 
 jobs:
-  verify:
-    name: Verify release
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24.0.0
-          cache: npm
-      - name: Setup Deno
-        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
-        with:
-          deno-version: 2.9.0
-      - name: Install dependencies
-        run: npm ci
-      - name: Check
-        run: npm run check
-      - name: Verify release metadata
-        run: node scripts/release-gate.mjs "${GITHUB_REF_NAME}"
-
-  npm:
-    name: Publish npm package
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout
+      - name: Checkout the released ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.ref }}
+
+      - name: Read tool versions
+        id: toolversions
+        run: |
+          echo "node=$(awk '/^nodejs /{print $2}' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "deno=$(awk '/^deno /{print $2}' .tool-versions)" >> "$GITHUB_OUTPUT"
+
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: ${{ steps.toolversions.outputs.node }}
+          package-manager-cache: false
           registry-url: https://registry.npmjs.org
-          cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Publish
-        shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          package=$(node --print "require('./package.json').name")
-          version=$(node --print "require('./package.json').version")
-          if npm view "${package}@${version}" version >/dev/null 2>&1; then
-            echo "${package}@${version} is already published; skipping npm."
-          else
-            npm publish
-          fi
 
-  jsr:
-    name: Publish JSR package
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          cache: npm
       - name: Setup Deno
         uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
-          deno-version: 2.9.0
-      - name: Install dependencies
-        run: npm ci
-      - name: Publish
-        shell: bash
+          deno-version: ${{ steps.toolversions.outputs.deno }}
+
+      - name: Resolve and verify release metadata
+        id: meta
+        env:
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          package=$(node --print "require('./jsr.json').name")
-          version=$(node --print "require('./jsr.json').version")
-          if deno info "jsr:${package}@${version}" >/dev/null 2>&1; then
-            echo "${package}@${version} is already published; skipping JSR."
-          else
-            deno publish
+          set -euo pipefail
+
+          npm_name="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).name")"
+          npm_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          jsr_name="$(node -p "JSON.parse(require('node:fs').readFileSync('jsr.json', 'utf8')).name")"
+          jsr_version="$(node -p "JSON.parse(require('node:fs').readFileSync('jsr.json', 'utf8')).version")"
+
+          if [ "${npm_name}" != "@ismail-elkorchi/http-client" ]; then
+            echo "::error::Unexpected npm package name: ${npm_name}"
+            exit 1
+          fi
+          if [ "${jsr_name}" != "@ismail-elkorchi/http-client" ]; then
+            echo "::error::Unexpected JSR package name: ${jsr_name}"
+            exit 1
+          fi
+          if [ "${npm_version}" != "${jsr_version}" ]; then
+            echo "::error::Version mismatch: npm=${npm_version} jsr=${jsr_version}"
+            exit 1
           fi
 
-  github:
-    name: Publish GitHub release
-    needs:
-      - npm
-      - jsr
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if ! gh release view "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "${GITHUB_REF_NAME#v}" \
-              --generate-notes
+          publish="false"
+          npm_tag="latest"
+          if [[ "${npm_version}" == *-* ]]; then
+            npm_tag="next"
           fi
+
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            publish="true"
+            if [ "${RELEASE_TAG}" != "v${npm_version}" ]; then
+              echo "::error::Tag version mismatch: tag=${RELEASE_TAG} package=${npm_version}"
+              exit 1
+            fi
+            version_is_prerelease="false"
+            if [[ "${npm_version}" == *-* ]]; then
+              version_is_prerelease="true"
+            fi
+            if [ "${RELEASE_PRERELEASE}" != "${version_is_prerelease}" ]; then
+              echo "::error::GitHub pre-release state does not match ${npm_version}"
+              exit 1
+            fi
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "::error::Release commit is not contained in main"
+              exit 1
+            fi
+          fi
+
+          node scripts/release-gate.mjs "v${npm_version}"
+
+          {
+            echo "npm_name=${npm_name}"
+            echo "jsr_name=${jsr_name}"
+            echo "version=${npm_version}"
+            echo "npm_tag=${npm_tag}"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install
+        run: npm ci
+
+      - name: Run release gates
+        run: |
+          set -euo pipefail
+          npm run check:ci
+          deno publish --dry-run
+
+      - name: Inspect registry versions
+        id: registry
+        if: ${{ steps.meta.outputs.publish == 'true' }}
+        env:
+          JSR_NAME: ${{ steps.meta.outputs.jsr_name }}
+          NPM_NAME: ${{ steps.meta.outputs.npm_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          set +e
+          npm_view_output="$(npm view "${NPM_NAME}@${VERSION}" version 2>&1)"
+          npm_view_status=$?
+          set -e
+          npm_exists="false"
+          if [ ${npm_view_status} -eq 0 ]; then
+            npm_exists="true"
+          elif ! grep -Eqi 'E404|404 Not Found|not found' <<< "${npm_view_output}"; then
+            echo "::error::Unable to verify npm version state"
+            echo "${npm_view_output}"
+            exit 1
+          fi
+
+          export JSR_META
+          JSR_META="$(curl --fail --silent --show-error "https://jsr.io/${JSR_NAME}/meta.json")"
+          jsr_exists="$(node -e '
+            const meta = JSON.parse(process.env.JSR_META);
+            process.stdout.write(String(Object.hasOwn(meta.versions || {}, process.env.VERSION)));
+          ')"
+
+          if [ "${GITHUB_RUN_ATTEMPT}" = "1" ] && { [ "${npm_exists}" = "true" ] || [ "${jsr_exists}" = "true" ]; }; then
+            echo "::error::Version ${VERSION} already exists on npm or JSR"
+            exit 1
+          fi
+
+          if [ "${GITHUB_RUN_ATTEMPT}" != "1" ] && [ "${npm_exists}" = "true" ]; then
+            npm_repository="$(npm view "${NPM_NAME}@${VERSION}" repository.url)"
+            if [ "${npm_repository}" != "git+https://github.com/Ismail-elkorchi/http-client.git" ]; then
+              echo "::error::Existing npm version does not identify this repository"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "npm_exists=${npm_exists}"
+            echo "jsr_exists=${jsr_exists}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish npm
+        if: ${{ steps.meta.outputs.publish == 'true' && steps.registry.outputs.npm_exists != 'true' }}
+        env:
+          NPM_TAG: ${{ steps.meta.outputs.npm_tag }}
+        run: npm publish --access public --tag "${NPM_TAG}"
+
+      - name: Publish JSR
+        if: ${{ steps.meta.outputs.publish == 'true' && steps.registry.outputs.jsr_exists != 'true' }}
+        run: deno publish
+
+      - name: Verify published packages
+        if: ${{ steps.meta.outputs.publish == 'true' }}
+        env:
+          JSR_NAME: ${{ steps.meta.outputs.jsr_name }}
+          NPM_NAME: ${{ steps.meta.outputs.npm_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            published_npm_version="$(npm view "${NPM_NAME}@${VERSION}" version 2>/dev/null || true)"
+            if [ "${published_npm_version}" = "${VERSION}" ]; then
+              break
+            fi
+            if [ "${attempt}" = "12" ]; then
+              echo "::error::npm did not return the published version"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          for attempt in {1..12}; do
+            export JSR_META
+            JSR_META="$(curl --fail --silent --show-error --header 'Cache-Control: no-cache' "https://jsr.io/${JSR_NAME}/meta.json")"
+            if node -e '
+              const meta = JSON.parse(process.env.JSR_META);
+              process.exit(Object.hasOwn(meta.versions || {}, process.env.VERSION) ? 0 : 1);
+            '; then
+              break
+            fi
+            if [ "${attempt}" = "12" ]; then
+              echo "::error::JSR did not return the published version"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          {
+            echo "### Published HTTP Client ${VERSION}"
+            echo
+            echo "- [npm](https://www.npmjs.com/package/${NPM_NAME}/v/${VERSION})"
+            echo "- [JSR](https://jsr.io/${JSR_NAME}@${VERSION})"
+            echo "- [GitHub Release](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/v${VERSION})"
+          } >> "$GITHUB_STEP_SUMMARY"

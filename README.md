@@ -18,7 +18,7 @@ npm install @ismail-elkorchi/http-client
 From JSR:
 
 ```ts
-import { NodeHttpClient } from "jsr:@ismail-elkorchi/http-client@^0.1.0";
+import { NodeHttpClient } from "jsr:@ismail-elkorchi/http-client@^0.1.1";
 ```
 
 ## Stream a response
@@ -231,3 +231,10 @@ npm run check
 The check runs strict TypeScript, lint, runtime and public-type tests,
 offline packed-package consumers for Node.js and Deno, and the JSR publication
 dry run.
+
+## Releases
+
+A published `v<version>` GitHub Release is the only publication trigger. The
+release commit must be contained in `main`, and its tag, changelog, npm
+metadata, and JSR metadata must agree. npm and JSR publication use GitHub OIDC;
+the repository does not use registry tokens.

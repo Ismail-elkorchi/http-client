@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { test } from "node:test";
 import {
+  disposeResponseBody,
   HttpConfigurationError,
   NodeHttpClient,
   readResponseBody,
@@ -905,6 +906,53 @@ test("preserves the HTTP/1.1 status message", async () => {
     assert.equal(result.kind, "response");
     assert.equal(result.statusCode, 299);
     assert.equal(result.statusMessage, "Custom Status");
+  } finally {
+    await client.close();
+    await closeServer(server);
+  }
+});
+
+test("preserves conditional request fields and validator responses", async () => {
+  let observedIfNoneMatch = null;
+  let observedIfModifiedSince = null;
+  const server = await listen(
+    http.createServer((request, response) => {
+      observedIfNoneMatch = request.headers["if-none-match"] ?? null;
+      observedIfModifiedSince = request.headers["if-modified-since"] ?? null;
+      response.writeHead(304, {
+        etag: '"current"',
+        "last-modified": "Fri, 21 Aug 2026 12:00:00 GMT",
+      });
+      response.end();
+    }),
+  );
+  const client = new NodeHttpClient({
+    networkSafety: { allowLocalhost: true },
+  });
+  try {
+    const result = await client.fetchBuffered(urlFor(server, "/document"), {
+      fields: [
+        { name: "if-none-match", value: '"previous"' },
+        {
+          name: "if-modified-since",
+          value: "Thu, 20 Aug 2026 12:00:00 GMT",
+        },
+      ],
+    });
+    assert.equal(result.kind, "response");
+    assert.equal(result.statusCode, 304);
+    assert.equal(result.finalUrl, urlFor(server, "/document"));
+    assert.equal(result.fields.first("etag"), '"current"');
+    assert.equal(
+      result.fields.first("last-modified"),
+      "Fri, 21 Aug 2026 12:00:00 GMT",
+    );
+    assert.equal(observedIfNoneMatch, '"previous"');
+    assert.equal(
+      observedIfModifiedSince,
+      "Thu, 20 Aug 2026 12:00:00 GMT",
+    );
+    await disposeResponseBody(result.body);
   } finally {
     await client.close();
     await closeServer(server);

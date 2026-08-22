@@ -1,5 +1,14 @@
 # Changes to HTTP Client
 
+## 0.1.1 - 2026-08-22
+
+- Publish npm and JSR packages from a verified GitHub Release through
+  short-lived trusted identities instead of repository secrets.
+- Verify conditional request fields, validator responses, default network
+  rejection, explicit localhost admission, and clean shutdown through packed
+  Node.js and Deno consumers.
+- Pin the supported Node.js and Deno toolchain used by CI and releases.
+
 ## 0.1.0 - 2026-08-09
 
 - Add streaming and buffered HTTP/1.1 and HTTP/2 requests with explicit

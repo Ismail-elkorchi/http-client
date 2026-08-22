@@ -1,6 +1,6 @@
 {
   "name": "@ismail-elkorchi/http-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Strict streaming HTTP/1.1 and HTTP/2 client with bounded transfers and network safety.",
   "type": "module",
   "sideEffects": false,
@@ -53,6 +53,8 @@
     "test:package": "node scripts/verify-package.mjs",
     "check:jsr": "deno publish --dry-run --allow-dirty",
     "check": "npm run lint && npm run test && npm run typecheck:public && npm run test:package && npm run check:jsr",
+    "check:audit": "npm audit --audit-level=high",
+    "check:ci": "npm run check && npm run check:audit",
     "prepack": "npm run build"
   },
   "dependencies": {

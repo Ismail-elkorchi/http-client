@@ -26,7 +26,20 @@ const temporaryDirectory = await fs.mkdtemp(
 );
 const packageDirectory = path.join(temporaryDirectory, "packages");
 const consumerDirectory = path.join(temporaryDirectory, "consumer");
-const server = http.createServer((_request, response) => {
+const server = http.createServer((request, response) => {
+  if (request.url === "/conditional") {
+    if (request.headers["if-none-match"] !== '"packed-v1"') {
+      response.writeHead(412);
+      response.end("missing validator");
+      return;
+    }
+    response.writeHead(304, {
+      etag: '"packed-v1"',
+      "last-modified": "Fri, 21 Aug 2026 12:00:00 GMT",
+    });
+    response.end();
+    return;
+  }
   response.writeHead(207, "Verified Package", {
     "content-type": "text/plain",
   });
@@ -225,6 +238,17 @@ import {
 } from "@ismail-elkorchi/http-client";
 
 const runtime = process.argv[2];
+const rejectedClient = new NodeHttpClient();
+try {
+  const rejected = await rejectedClient.requestBuffered(
+    process.env.HTTP_CLIENT_TEST_URL,
+  );
+  assert.equal(rejected.kind, "failure");
+  assert.equal(rejected.error.code, "NETWORK_SAFETY_REJECTED");
+} finally {
+  await rejectedClient.close();
+}
+
 const client = new NodeHttpClient({
   networkSafety: { allowLocalhost: true },
 });
@@ -238,6 +262,19 @@ try {
     "installed package",
   );
   await disposeResponseBody(result.body);
+
+  const conditional = await client.fetchBuffered(
+    new URL("conditional", process.env.HTTP_CLIENT_TEST_URL),
+    { fields: [{ name: "if-none-match", value: '"packed-v1"' }] },
+  );
+  assert.equal(conditional.kind, "response");
+  assert.equal(conditional.statusCode, 304);
+  assert.equal(conditional.fields.first("etag"), '"packed-v1"');
+  assert.equal(
+    conditional.fields.first("last-modified"),
+    "Fri, 21 Aug 2026 12:00:00 GMT",
+  );
+  await disposeResponseBody(conditional.body);
   console.log(runtime + " packed consumer passed");
 } finally {
   await client.close();
